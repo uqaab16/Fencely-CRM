@@ -107,7 +107,16 @@ export function checkMcpToken(req) {
   const expected = process.env.MCP_TOKEN || '';
   if (!expected) return false; // fail closed
   const token = bearer(req);
-  return !!token && safeEqual(token, expected);
+  if (token && safeEqual(token, expected)) return true;
+  // Fallback: token in the URL query (?token=...), for MCP clients that
+  // cannot set custom headers (e.g. claude.ai custom connectors).
+  // Treat such URLs as secret — they grant full MCP access.
+  try {
+    const u = new URL(req.url || '/', 'http://localhost');
+    const qt = u.searchParams.get('token') || u.searchParams.get('access_token');
+    if (qt && safeEqual(qt, expected)) return true;
+  } catch { /* ignore malformed URL */ }
+  return false;
 }
 
 /**
