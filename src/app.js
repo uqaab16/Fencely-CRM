@@ -197,7 +197,7 @@ export default async function handler(req, res) {
     await ensureReady();
 
     // --- public ---
-    if (p === '/api/health') return send(res, 200, { ok: true, app: 'fencely-crm', aiEnabled: aiEnabled(), time: new Date().toISOString() });
+    if (p === '/api/health') return send(res, 200, { ok: true, app: 'fencely-crm', db: db.backendKind(), aiEnabled: aiEnabled(), time: new Date().toISOString() });
 
     if (p === '/api/auth/login' && req.method === 'POST') {
       if (!process.env.JWT_SECRET) return send(res, 503, { error: 'Login is not configured: JWT_SECRET is missing.' });
@@ -260,6 +260,18 @@ export default async function handler(req, res) {
       if (m && req.method === 'GET') { const c = await db.getContractor(m[1]); return c ? send(res, 200, c) : send(res, 404, { error: 'Not found' }); }
       if (m && req.method === 'PUT') { const c = await db.updateContractor(m[1], await readBody(req)); return c ? send(res, 200, c) : send(res, 404, { error: 'Not found' }); }
       if (m && req.method === 'DELETE') return send(res, 200, { deleted: await db.deleteContractor(m[1]) });
+      if (p === '/api/contractors' && req.method === 'DELETE') {
+        const b = await readBody(req);
+        return send(res, 200, { deleted: await db.bulkDeleteContractors(b.ids || []) });
+      }
+      if (p === '/api/contractors/stage' && req.method === 'PUT') {
+        const b = await readBody(req);
+        try {
+          return send(res, 200, { updated: await db.bulkSetStage(b.ids || [], b.stage) });
+        } catch (err) {
+          return send(res, 400, { error: err.message });
+        }
+      }
       const note = p.match(/^\/api\/contractors\/(\d+)\/notes$/);
       if (note && req.method === 'POST') { const b = await readBody(req); return send(res, 201, await db.addNote(note[1], b.body || '')); }
       const contact = p.match(/^\/api\/contractors\/(\d+)\/log-contact$/);
@@ -288,15 +300,23 @@ export default async function handler(req, res) {
       if (p === '/api/import' && req.method === 'POST') {
         const b = await readBody(req);
         const items = b.csv ? parseCsv(b.csv) : (b.records || []);
-        // Load the existing table once and dedupe against it (plus rows created
+        // Load the existing table once and dedupe against it (plus rows staged
         // in this same import) instead of re-scanning per row — same semantics.
+        // Rows are then written with bulkCreateContractors: a few batched
+        // pipeline calls total, so a 1,013-row CSV finishes well under the
+        // 60s serverless limit (the old per-row loop timed out mid-import).
         const pool = await db.listContractors();
-        let created = 0, skipped = 0; const skippedNames = [];
+        const staged = [];
+        let skipped = 0; const skippedNames = [];
         for (const item of items) {
           if (!item.business_name) { skipped++; continue; }
-          if ((await db.findDuplicates(item, null, pool)).length && !b.force) { skipped++; skippedNames.push(item.business_name); continue; }
-          pool.push(await db.createContractor(item)); created++;
+          const c = db.normalise(item);
+          const dup = !b.force
+            && (pool.some((r) => db.contractorsMatch(c, r)) || staged.some((r) => db.contractorsMatch(c, r)));
+          if (dup) { skipped++; skippedNames.push(item.business_name); continue; }
+          staged.push(c);
         }
+        const created = await db.bulkCreateContractors(staged);
         return send(res, 200, { created, skipped, skippedNames });
       }
       if (p === '/api/template.csv') {

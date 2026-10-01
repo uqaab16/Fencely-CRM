@@ -49,6 +49,10 @@ export default function App() {
   const [drawerTick, setDrawerTick] = useState(0);
   const [toasts, setToasts] = useState([]);
   const toastSeq = useRef(0);
+  // Bulk selection for the table (checkbox column). Cleared whenever the
+  // visible list changes or a bulk action runs.
+  const [selected, setSelected] = useState([]);
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   const toast = useCallback((kind, message) => {
     const id = ++toastSeq.current;
@@ -140,7 +144,11 @@ export default function App() {
         has_mobile: f.has_mobile ? 1 : '',
       };
       const rows = await api.contractors(params);
-      if (seq === listSeq.current) setContractors(rows); // ignore stale responses
+      if (seq === listSeq.current) {
+        setContractors(rows);
+        // Prune the bulk selection to rows still visible (honest count in the bar).
+        setSelected((sel) => sel.filter((id) => rows.some((r) => r.id === id)));
+      }
     } catch (err) {
       if (err.status !== 401) toast('error', err.message);
     } finally {
@@ -162,6 +170,53 @@ export default function App() {
     setFilters(EMPTY_FILTERS);
     setDebouncedText({ q: '', city: '' }); // clear now, don't wait for the debounce
   }, []);
+
+  // --- Bulk actions ------------------------------------------------------
+  const toggleSelect = useCallback((id) => {
+    setSelected((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]));
+  }, []);
+  const toggleSelectAll = useCallback(
+    (checked) => {
+      setSelected((sel) => {
+        if (!checked) return sel.filter((id) => !contractors.some((c) => c.id === id));
+        const visible = contractors.map((c) => c.id);
+        return [...new Set([...sel, ...visible])];
+      });
+    },
+    [contractors],
+  );
+  const clearSelection = useCallback(() => setSelected([]), []);
+
+  async function handleBulkDelete() {
+    if (!selected.length) return;
+    if (!window.confirm(`Delete ${selected.length} selected contractor${selected.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkDelete(selected);
+      toast('success', `Deleted ${r.deleted} contractor${r.deleted === 1 ? '' : 's'}.`);
+      clearSelection();
+      handleMutated();
+    } catch (err) {
+      toast('error', err.message || 'Bulk delete failed.');
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function handleBulkStage(stage) {
+    if (!selected.length || !stage) return;
+    setBulkBusy(true);
+    try {
+      const r = await api.bulkSetStage(selected, stage);
+      toast('success', `Moved ${r.updated} contractor${r.updated === 1 ? '' : 's'} → ${stage}.`);
+      clearSelection();
+      handleMutated();
+    } catch (err) {
+      toast('error', err.message || 'Bulk stage change failed.');
+    } finally {
+      setBulkBusy(false);
+    }
+  }
 
   // Something changed (stage move, note, task, log-contact, import…):
   // refresh the stats strip + grid + follow-ups view.
@@ -276,6 +331,8 @@ export default function App() {
       const r = await api.importCsv(text);
       const extra = r.skippedNames && r.skippedNames.length ? ` Skipped: ${r.skippedNames.slice(0, 8).join(', ')}${r.skippedNames.length > 8 ? '…' : ''}` : '';
       toast('success', `Import done: ${r.created} created, ${r.skipped} skipped (duplicates/invalid).${extra}`);
+      resetFilters(); // show the full list after an import — no leftover filters
+      clearSelection();
       handleMutated();
     } catch (err) {
       toast('error', err.message || 'Import failed.');
@@ -356,12 +413,38 @@ export default function App() {
       />
 
       <main className="main">
+        {selected.length > 0 && view === 'table' && (
+          <div className="bulk-bar" role="toolbar" aria-label="Bulk actions">
+            <b>{selected.length}</b>&nbsp;selected
+            <select
+              className="stage-select"
+              defaultValue=""
+              disabled={bulkBusy}
+              onChange={(e) => { if (e.target.value) { handleBulkStage(e.target.value); e.target.value = ''; } }}
+              aria-label="Move selected to stage"
+            >
+              <option value="" disabled>Move to stage…</option>
+              {(meta.stages || []).map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+            <button className="btn btn-danger btn-small" disabled={bulkBusy} onClick={handleBulkDelete}>
+              Delete selected
+            </button>
+            <button className="btn btn-ghost btn-small" disabled={bulkBusy} onClick={clearSelection}>
+              Clear
+            </button>
+          </div>
+        )}
         {view === 'table' && (
           <ContractorsTable
             contractors={contractors}
             meta={meta}
             loading={loadingList}
             total={stats?.total ?? 0}
+            selected={selected}
+            onToggleSelect={toggleSelect}
+            onToggleSelectAll={toggleSelectAll}
             onOpen={setSelectedId}
             onMoveStage={moveStage}
             onLogContact={logContact}

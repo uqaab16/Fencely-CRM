@@ -212,6 +212,79 @@ export async function createContractor(input) {
   return getContractor(id);
 }
 
+/**
+ * Fast bulk insert for CSV imports. All rows are normalised + scored in
+ * memory, then written through the backend's batched pipeline (a few HTTP
+ * round-trips total instead of 3 per row). This is what keeps a 1,013-row
+ * import under Vercel's 60s function limit. Each row still gets its
+ * 'created' timeline entry, same as createContractor.
+ */
+export async function bulkCreateContractors(inputs) {
+  const b = await ready();
+  const prepared = inputs.map((input) => {
+    const c = normalise(input);
+    return { args: insertValues(c, scoreLead(c)) };
+  });
+  const BATCH = 200;
+  let created = 0;
+  for (let i = 0; i < prepared.length; i += BATCH) {
+    const chunk = prepared.slice(i, i + BATCH);
+    const rs = await b.batch(chunk.map(({ args }) => ({ sql: INSERT_SQL, args, type: 'run' })));
+    const ids = rs.map((r) => r.lastInsertRowid).filter((id) => Number(id) > 0);
+    if (ids.length) {
+      await b.batch(
+        ids.map((id) => ({
+          sql: 'INSERT INTO activities (contractor_id,type,body) VALUES (?,?,?)',
+          args: [Number(id), 'created', 'Record created'],
+          type: 'run',
+        })),
+      );
+    }
+    created += chunk.length;
+  }
+  return created;
+}
+
+/** Delete many contractors (+ their activities/tasks) in batched statements. */
+export async function bulkDeleteContractors(ids) {
+  const b = await ready();
+  const clean = [...new Set((ids || []).map(Number).filter((n) => n > 0))];
+  if (!clean.length) return 0;
+  let deleted = 0;
+  const BATCH = 200;
+  for (let i = 0; i < clean.length; i += BATCH) {
+    const chunk = clean.slice(i, i + BATCH);
+    const ph = chunk.map(() => '?').join(',');
+    const rs = await b.batch([
+      { sql: `DELETE FROM activities WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
+      { sql: `DELETE FROM tasks WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
+      { sql: `DELETE FROM contractors WHERE id IN (${ph})`, args: chunk, type: 'run' },
+    ]);
+    deleted += rs[2].changes || 0;
+  }
+  return deleted;
+}
+
+/** Move many contractors to one stage in batched statements (no per-row timeline entries). */
+export async function bulkSetStage(ids, stage) {
+  if (!STAGES.includes(stage)) throw new Error('Invalid stage');
+  const b = await ready();
+  const clean = [...new Set((ids || []).map(Number).filter((n) => n > 0))];
+  if (!clean.length) return 0;
+  let updated = 0;
+  const BATCH = 200;
+  for (let i = 0; i < clean.length; i += BATCH) {
+    const chunk = clean.slice(i, i + BATCH);
+    const ph = chunk.map(() => '?').join(',');
+    const r = await b.run(
+      `UPDATE contractors SET stage=?, updated_at=datetime('now') WHERE id IN (${ph})`,
+      [stage, ...chunk],
+    );
+    updated += r.changes || 0;
+  }
+  return updated;
+}
+
 export async function getContractor(id) {
   const b = await ready();
   const [cRes, aRes, tRes] = await b.batch([
@@ -403,7 +476,11 @@ export async function createUser(email, passwordHash) {
 }
 
 // --- Seed dummy data (clearly labelled SAMPLE; content unchanged) ---
+// Opt-in only: set SEED_SAMPLE_DATA=1 to seed a fresh empty database (handy
+// for UI demos / local dev). Never auto-seeds in production — dummy rows in
+// a real database silently pollute counts and exports.
 export async function seedIfEmpty() {
+  if (process.env.SEED_SAMPLE_DATA !== '1') return 0;
   const r = await one('SELECT COUNT(*) AS n FROM contractors');
   if (Number(r?.n || 0) > 0) return 0;
   const samples = [

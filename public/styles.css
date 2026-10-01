@@ -1,0 +1,17 @@
+body{font-family:system-ui,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+header{display:flex;gap:16px;align-items:center;padding:12px 20px;background:#1e293b;flex-wrap:wrap}
+header h1{margin:0;font-size:20px}.sub{color:#94a3b8}nav button,.filters button{background:#334155;color:#e2e8f0;border:1px solid #475569;border-radius:8px;padding:6px 12px;cursor:pointer}
+nav button.active{background:#0ea5e9;color:#fff}
+.stats{display:flex;gap:12px;padding:14px 20px;flex-wrap:wrap}.stat{background:#1e293b;border-radius:12px;padding:10px 16px;min-width:110px}.stat b{font-size:22px;display:block}
+.filters{display:flex;gap:8px;padding:0 20px 14px;flex-wrap:wrap;align-items:center}
+input,select,textarea{background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:8px;padding:6px 8px}
+main{padding:0 20px 30px}table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:12px;overflow:hidden}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #334155;font-size:13px}tr:hover td{background:#273549;cursor:pointer}
+.tag{background:#0ea5e9;color:#fff;border-radius:20px;padding:1px 8px;font-size:11px;margin-right:4px;display:inline-block}
+.score{font-weight:700}.hidden{display:none!important}
+.kanban{display:flex;gap:10px;overflow-x:auto}.col{min-width:210px;background:#1e293b;border-radius:12px;padding:8px}.col h4{margin:4px 0 8px;font-size:13px}
+.card{background:#273549;border-radius:8px;padding:8px;margin-bottom:8px;cursor:pointer;font-size:13px}
+.drawer{position:fixed;top:0;right:0;width:min(480px,95vw);height:100%;background:#1e293b;box-shadow:-4px 0 20px #0008;padding:20px;overflow:auto;z-index:5}
+.drawer h2{margin-top:0}.activity{border-left:3px solid #0ea5e9;padding:4px 10px;margin:8px 0;background:#273549;border-radius:6px;font-size:13px}
+dialog{background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:12px;width:min(640px,95vw)}dialog label{display:block;margin:8px 0;font-size:13px}dialog input,dialog select,dialog textarea{width:100%;box-sizing:border-box}
+.wa-ok{color:#4ade80}.wa-mid{color:#facc15}.wa-no{color:#94a3b8}

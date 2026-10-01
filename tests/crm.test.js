@@ -71,3 +71,43 @@ test('logContact: stage transition + last_contacted + follow-up task only once',
   assert.ok(after2.activities.some(a => a.type === 'contact' && a.body.includes('Call made')));
   assert.equal(after2.tasks.filter(t => !t.done).length, 1, 'second contact must not create a duplicate follow-up task');
 });
+
+test('bulkCreateContractors inserts rows fast with timeline entries', async () => {
+  const n = await db.bulkCreateContractors([
+    { business_name: 'Bulk A Fencing', state: 'NSW', city: 'Sydney', mobile: '0400 900 001' },
+    { business_name: 'Bulk B Fencing', state: 'VIC', city: 'Melbourne', email: 'b@example.com' },
+    { business_name: 'Bulk C Fencing', state: 'QLD', city: 'Brisbane', landline: '07 3000 0003' },
+  ]);
+  assert.equal(n, 3);
+  const rows = (await db.listContractors()).filter((c) => c.business_name.startsWith('Bulk '));
+  assert.equal(rows.length, 3);
+  for (const r of rows) {
+    const full = await db.getContractor(r.id);
+    assert.ok(full.activities.some((a) => a.type === 'created'), `created activity for ${r.business_name}`);
+  }
+});
+
+test('bulkSetStage moves many + rejects bad stage', async () => {
+  const rows = (await db.listContractors()).filter((c) => c.business_name.startsWith('Bulk '));
+  const ids = rows.map((r) => r.id);
+  const updated = await db.bulkSetStage(ids, 'Contacted');
+  assert.equal(updated, 3);
+  const one1 = await db.getContractor(ids[0]);
+  assert.equal(one1.stage, 'Contacted');
+  await assert.rejects(db.bulkSetStage(ids, 'Nope'), /Invalid stage/);
+});
+
+test('bulkDeleteContractors removes rows + their activities/tasks', async () => {
+  const rows = (await db.listContractors()).filter((c) => c.business_name.startsWith('Bulk '));
+  const ids = rows.map((r) => r.id);
+  await db.createTask({ contractor_id: ids[0], title: 'bulk task', due_date: '2000-01-01' });
+  const deleted = await db.bulkDeleteContractors(ids);
+  assert.equal(deleted, 3);
+  assert.equal((await db.listContractors()).filter((c) => c.business_name.startsWith('Bulk ')).length, 0);
+  assert.equal(await db.bulkDeleteContractors([]), 0);
+});
+
+test('seedIfEmpty is opt-in (no auto seed without SEED_SAMPLE_DATA=1)', async () => {
+  delete process.env.SEED_SAMPLE_DATA;
+  assert.equal(await db.seedIfEmpty(), 0);
+});

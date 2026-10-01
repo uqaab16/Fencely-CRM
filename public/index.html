@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fencely CRM — Contractor Outreach</title><link rel="stylesheet" href="/styles.css"></head>
+<body>
+<header><h1>🧱 Fencely CRM</h1><span class="sub">Contractor outreach • Australia</span>
+<nav><button data-view="table" class="active">Table</button><button data-view="kanban">Pipeline</button><button data-view="tasks">Follow-ups</button></nav></header>
+
+<section id="stats" class="stats"></section>
+
+<section class="filters">
+<input id="q" placeholder="Search business, city, email, phone…">
+<select id="f-state"><option value="">All states</option></select>
+<input id="f-city" placeholder="City filter">
+<select id="f-niche"><option value="">All niches</option></select>
+<select id="f-wa"><option value="">WhatsApp: any</option></select>
+<select id="f-stage"><option value="">Stage: any</option></select>
+<label><input type="checkbox" id="f-email"> Has email</label>
+<label><input type="checkbox" id="f-mobile"> Has mobile</label>
+<button id="addBtn">+ Add contractor</button>
+<button id="exportBtn">Export CSV</button>
+<label class="import">Import CSV <input type="file" id="importFile" accept=".csv"></label>
+<a href="/api/template.csv">CSV template</a>
+</section>
+
+<main>
+<div id="tableView"><table><thead><tr><th>Business</th><th>State/City</th><th>Niches</th><th>Landline</th><th>Mobile</th><th>WhatsApp</th><th>Email</th><th>Stage</th><th>Score</th><th>Next follow-up</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div id="kanbanView" class="hidden"><div id="kanban" class="kanban"></div></div>
+<div id="tasksView" class="hidden"><h3>Follow-ups due today / overdue</h3><ul id="dueList"></ul><h3>All tasks</h3><ul id="taskList"></ul>
+<form id="taskForm"><input id="t-title" placeholder="New task title" required><input id="t-due" type="date"><button>Add task</button></form></div>
+</main>
+
+<div id="drawer" class="drawer hidden"></div>
+<dialog id="editDlg"><form id="editForm"></form></dialog>
+<script src="/app.js"></script>
+</body></html>

@@ -15,9 +15,21 @@ const LOG_BUTTONS = [
 
 // Contractors grid. Row click opens the detail drawer; the Stage cell is a
 // dropdown for one-click pipeline moves (PUT /api/contractors/:id {stage}),
-// and each row carries compact quick-log buttons (📞 💬 ✉️) that record
-// outside-CRM contact in one tap (POST /api/contractors/:id/log-contact).
-export default function ContractorsTable({ contractors, meta, loading, total, onOpen, onMoveStage, onLogContact }) {
+// each row carries compact quick-log buttons (📞 💬 ✉️) that record
+// outside-CRM contact in one tap, and the left checkbox column feeds the
+// bulk-action bar (bulk delete / bulk stage change).
+export default function ContractorsTable({
+  contractors,
+  meta,
+  loading,
+  total,
+  selected,
+  onToggleSelect,
+  onToggleSelectAll,
+  onOpen,
+  onMoveStage,
+  onLogContact,
+}) {
   const [logging, setLogging] = useState(null); // { id, channel } while a log call is in flight
 
   async function log(c, channel) {
@@ -51,11 +63,26 @@ export default function ContractorsTable({ contractors, meta, loading, total, on
     );
   }
 
+  const selectedSet = new Set(selected || []);
+  const allVisibleSelected = contractors.length > 0 && contractors.every((c) => selectedSet.has(c.id));
+  const someVisibleSelected = contractors.some((c) => selectedSet.has(c.id));
+
   return (
     <div className="table-wrap">
       <table className="grid">
         <thead>
           <tr>
+            <th className="sel-col" onClick={(e) => e.stopPropagation()}>
+              <input
+                type="checkbox"
+                aria-label="Select all listed contractors"
+                title="Select all listed contractors"
+                checked={allVisibleSelected}
+                ref={(el) => { if (el) el.indeterminate = !allVisibleSelected && someVisibleSelected; }}
+                onChange={(e) => onToggleSelectAll(e.target.checked)}
+                onClick={(e) => e.stopPropagation()}
+              />
+            </th>
             <th>Business</th>
             <th>State/City</th>
             <th>Niches</th>
@@ -71,7 +98,16 @@ export default function ContractorsTable({ contractors, meta, loading, total, on
         </thead>
         <tbody>
           {contractors.map((c) => (
-            <tr key={c.id} onClick={() => onOpen(c.id)}>
+            <tr key={c.id} onClick={() => onOpen(c.id)} className={selectedSet.has(c.id) ? 'row-selected' : ''}>
+              <td className="sel-col" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  aria-label={`Select ${c.business_name}`}
+                  checked={selectedSet.has(c.id)}
+                  onChange={() => onToggleSelect(c.id)}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </td>
               <td>
                 <b>{c.business_name}</b>
                 {c.contact_name ? (

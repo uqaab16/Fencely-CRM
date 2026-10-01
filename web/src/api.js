@@ -118,6 +118,8 @@ export const api = {
   createContractor: (obj) => json('/api/contractors', { method: 'POST', body: obj }),
   updateContractor: (id, obj) => json(`/api/contractors/${id}`, { method: 'PUT', body: obj }),
   deleteContractor: (id) => json(`/api/contractors/${id}`, { method: 'DELETE' }),
+  bulkDelete: (ids) => json('/api/contractors', { method: 'DELETE', body: { ids } }),
+  bulkSetStage: (ids, stage) => json('/api/contractors/stage', { method: 'PUT', body: { ids, stage } }),
   addNote: (id, body) => json(`/api/contractors/${id}/notes`, { method: 'POST', body: { body } }),
   // One-tap record of contact made outside the CRM (call / WhatsApp / email).
   // The server bumps last_contacted and auto-creates the follow-up task.
