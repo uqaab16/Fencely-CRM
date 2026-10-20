@@ -5,7 +5,13 @@ from the existing advertised-WhatsApp field. No messages are sent by this featur
 Existing contractor records and MCP tools are preserved. The new table is created
 automatically in local SQLite and Turso; existing tables need no column migration.
 
-## Connect your gateway
+## Private VPS gateway
+
+For a loopback-only gateway on a separate VPS, use the outbound-only
+[private bridge](whatsapp-private-bridge.md). Do not put a laptop localhost URL
+in Vercel. This mode queues registration reads and keeps the gateway key on VPS.
+
+## Connect your gateway directly
 
 Run your own WA-AKG server with a connected WhatsApp session. On the CRM backend
 (Vercel environment settings or your local server environment), set:

@@ -19,7 +19,10 @@ import * as auth from './auth.js';
 import { APP_NAME } from './config.js';
 import { toCsv, parseCsv, CSV_COLUMNS } from './csv.js';
 import { aiEnabled, explainScore, generateOutreachDraft, classifyNiches } from '../ai/claude.js';
-import { checkWhatsAppRegistration, gatewayConfigured, VERIFICATION_LABELS } from './whatsapp.js';
+import { gatewayConfigured, VERIFICATION_LABELS } from './whatsapp.js';
+
+import { requestWhatsAppCheck, bridgeConfigured } from './wa-service.js';
+import { bridgeAuthorized, bridgeResult } from './wa-bridge.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Serve the built React app (web/dist) when it exists; fall back to the
@@ -76,7 +79,7 @@ async function callMcpTool(name, args = {}) {
     case 'check_whatsapp': {
       const c = await db.getContractor(args.id);
       if (!c) return { error: 'Not found' };
-      return db.saveWhatsAppCheck(c.id, await checkWhatsAppRegistration(c));
+      return requestWhatsAppCheck(c);
     }
     case 'search_contractors': return db.listContractors(args);
     case 'get_contractor': return (await db.getContractor(args.id)) || { error: 'Not found' };
@@ -242,18 +245,32 @@ export default async function handler(req, res) {
       return send(res, 200, await runUpdateJob());
     }
 
+    // Dedicated, limited worker credential; never accepts a login/MCP token.
+    if (p.startsWith('/api/whatsapp/bridge/')) {
+      if (!bridgeAuthorized(req)) return send(res, 401, { error: 'Unauthorized' });
+      if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
+      if (p === '/api/whatsapp/bridge/claim') return send(res, 200, { job: await db.claimWhatsAppCheck() });
+      if (p === '/api/whatsapp/bridge/result') {
+        const b = await readBody(req);
+        if (typeof b.id !== 'string' || typeof b.token !== 'string' || typeof b.number !== 'string')
+          return send(res, 400, { error: 'Invalid check result' });
+        return send(res, 200, await db.finishWhatsAppCheck(b.id, b.token, bridgeResult(b.number, b)));
+      }
+      return send(res, 404, { error: 'Not found' });
+    }
+
     // --- everything else under /api requires a login JWT ---
     if (p.startsWith('/api/')) {
       const user = auth.authUser(req);
       if (!user) return send(res, 401, { error: 'Unauthorized' });
 
       if (p === '/api/auth/me' && req.method === 'GET') return send(res, 200, { email: user.email });
-      if (p === '/api/whatsapp/config' && req.method === 'GET') return send(res, 200, { configured: gatewayConfigured(), statuses: VERIFICATION_LABELS });
+      if (p === '/api/whatsapp/config' && req.method === 'GET') return send(res, 200, { configured: bridgeConfigured() || gatewayConfigured(), mode: bridgeConfigured() ? 'private-bridge' : 'direct', statuses: VERIFICATION_LABELS });
       const waCheck = p.match(/^\/api\/contractors\/(\d+)\/whatsapp-check$/);
       if (waCheck && req.method === 'POST') {
         const c = await db.getContractor(waCheck[1]);
         if (!c) return send(res, 404, { error: 'Not found' });
-        return send(res, 200, await db.saveWhatsAppCheck(c.id, await checkWhatsAppRegistration(c)));
+        return send(res, 200, await requestWhatsAppCheck(c));
       }
       if (p === '/api/stats') return send(res, 200, await db.stats());
       if (p === '/api/meta') return send(res, 200, { appName: APP_NAME, stages: db.STAGES, niches: db.NICHES, waStatuses: db.WA_STATUSES, csvColumns: CSV_COLUMNS });

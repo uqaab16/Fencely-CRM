@@ -8,7 +8,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as db from '../src/db.js';
-import { checkWhatsAppRegistration } from '../src/whatsapp.js';
+import { requestWhatsAppCheck } from '../src/wa-service.js';
 
 await db.init();
 
@@ -19,7 +19,7 @@ server.tool('check_whatsapp', 'Check one contractor number via your configured W
   async ({ id }) => {
     const c = await db.getContractor(id);
     if (!c) return txt({ error: 'Not found' });
-    return txt(await db.saveWhatsAppCheck(id, await checkWhatsAppRegistration(c)));
+    return txt(await requestWhatsAppCheck(c));
   });
 
 server.tool('search_contractors', 'Search/list contractors with filters',

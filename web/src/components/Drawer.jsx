@@ -141,7 +141,7 @@ export default function Drawer({ id, meta, refreshTick, onClose, onEdit, onDelet
     setWaBusy(true);
     try {
       const updated = await api.checkWhatsApp(id);
-      toast('success', WA_CHECK_LABELS[updated.whatsapp_verification?.status] || 'Check saved');
+      toast('success', updated.whatsapp_check_queued ? 'Check queued on VPS. Reopen this lead shortly to see the result.' : (WA_CHECK_LABELS[updated.whatsapp_verification?.status] || 'Check saved'));
       changed();
     } catch (err) {
       toast('error', err.message);
