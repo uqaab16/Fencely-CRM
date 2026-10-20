@@ -12,10 +12,12 @@
 // race schema creation. Domain behaviour (scoring, de-dupe, stages) is unchanged
 // from the original synchronous version.
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTursoClient } from './turso.js';
 import { STAGES, NICHES, FIT_NICHES } from './config.js';
+import { contractorWhatsAppNumber, VERIFICATION_LABELS } from './whatsapp.js';
 
 // Vocabulary comes from src/config.js (env-overridable); re-exported here so
 // existing imports (`db.STAGES`, `db.NICHES`) keep working.
@@ -114,6 +116,23 @@ const SCHEMA = [
 )`,
 `CREATE INDEX IF NOT EXISTS idx_activities_contractor ON activities(contractor_id)`,
 `CREATE INDEX IF NOT EXISTS idx_tasks_contractor ON tasks(contractor_id)`,
+`CREATE TABLE IF NOT EXISTS whatsapp_checks (
+  contractor_id INTEGER PRIMARY KEY REFERENCES contractors(id) ON DELETE CASCADE,
+  number TEXT NOT NULL,
+  status TEXT NOT NULL,
+  checked_at TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  jid TEXT DEFAULT ''
+)`,
+`CREATE TABLE IF NOT EXISTS whatsapp_check_jobs (
+  id TEXT PRIMARY KEY,
+  contractor_id INTEGER NOT NULL UNIQUE REFERENCES contractors(id) ON DELETE CASCADE,
+  number TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  token TEXT DEFAULT '',
+  lease_until INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL
+)`,
 ];
 
 async function createSchema(backend) {
@@ -171,8 +190,71 @@ export function parseNiches(c) {
 
 function row(r) {
   if (!r) return null;
-  return { ...r, niches: parseNiches(r), score_reasons: safeJson(r.score_reasons), done: undefined };
+  const verification = r.wa_check_status && r.wa_check_number === (contractorWhatsAppNumber(r) || '')
+    ? { status: r.wa_check_status, number: r.wa_check_number, checked_at: r.wa_checked_at, detail: r.wa_check_detail }
+    : { status: 'not_checked', number: contractorWhatsAppNumber(r) || '', checked_at: '', detail: '' };
+  return { ...r, whatsapp_verification: verification, niches: parseNiches(r), score_reasons: safeJson(r.score_reasons), done: undefined };
 }
+
+const CONTRACTOR_SELECT = `SELECT c.*, w.status AS wa_check_status, w.number AS wa_check_number,
+  w.checked_at AS wa_checked_at, w.detail AS wa_check_detail FROM contractors c
+  LEFT JOIN whatsapp_checks w ON w.contractor_id=c.id`;
+
+export async function saveWhatsAppCheck(id, result) {
+  if (!(result.status in VERIFICATION_LABELS) || result.status === 'not_checked') throw new Error('Invalid verification status');
+  const current = await getContractor(id);
+  if (!current || (contractorWhatsAppNumber(current) || '') !== result.number) {
+    const error = new Error('Contractor number changed during the check. Please retry.');
+    error.statusCode = 409;
+    throw error;
+  }
+  await run(`INSERT INTO whatsapp_checks (contractor_id,number,status,checked_at,detail,jid) VALUES (?,?,?,?,?,?)
+    ON CONFLICT(contractor_id) DO UPDATE SET number=excluded.number,status=excluded.status,
+    checked_at=excluded.checked_at,detail=excluded.detail,jid=excluded.jid`,
+    [Number(id), result.number, result.status, result.checked_at, result.detail, result.jid || '']);
+  await addActivity(id, 'whatsapp-check', `${VERIFICATION_LABELS[result.status]}: ${result.number || 'No valid number'}. ${result.detail}`);
+  return getContractor(id);
+}
+
+// Atomic SQL leases work across separate Vercel function instances. Only
+// registration reads are retried; this queue cannot send WhatsApp messages.
+export async function queueWhatsAppCheck(c) {
+  const number = contractorWhatsAppNumber(c);
+  if (!number) throw new Error('Invalid number');
+  await run(`INSERT INTO whatsapp_check_jobs (id,contractor_id,number,created_at) VALUES (?,?,?,?)
+    ON CONFLICT(contractor_id) DO UPDATE SET id=excluded.id,number=excluded.number,
+    state='queued',token='',lease_until=0,created_at=excluded.created_at
+    WHERE whatsapp_check_jobs.state='done' OR whatsapp_check_jobs.number<>excluded.number`,
+    [randomUUID(), c.id, number, Date.now()]);
+}
+
+export async function claimWhatsAppCheck(now = Date.now()) {
+  const jobs = await many(`UPDATE whatsapp_check_jobs SET state='running',token=?,lease_until=?
+    WHERE id=(SELECT id FROM whatsapp_check_jobs WHERE state='queued'
+      OR (state IN ('running','completing') AND lease_until<?) ORDER BY created_at LIMIT 1)
+    RETURNING id,contractor_id,number,token`, [randomUUID(), now + 120000, now]);
+  return jobs[0] || null;
+}
+
+export async function finishWhatsAppCheck(id, token, result) {
+  const job = await one('SELECT * FROM whatsapp_check_jobs WHERE id=?', [id]);
+  const conflict = () => { const e = new Error('Check lease expired or superseded'); e.statusCode = 409; return e; };
+  if (!job || !token || job.token !== token) throw conflict();
+  if (job.state === 'done') return { ok: true }; // retry after a lost HTTP response
+  const claimed = await run(`UPDATE whatsapp_check_jobs SET state='completing'
+    WHERE id=? AND token=? AND state='running' AND lease_until>=?`, [id, token, Date.now()]);
+  if (!claimed.changes) throw conflict();
+  try {
+    if (result.number !== job.number) throw conflict();
+    await saveWhatsAppCheck(job.contractor_id, result);
+    await run("UPDATE whatsapp_check_jobs SET state='done' WHERE id=? AND token=?", [id, token]);
+    return { ok: true };
+  } catch (e) {
+    await run("UPDATE whatsapp_check_jobs SET state='queued',token='',lease_until=0 WHERE id=? AND token=?", [id, token]);
+    throw e;
+  }
+}
+
 function safeJson(v) { try { const x = JSON.parse(v || '[]'); return Array.isArray(x) ? x : []; } catch { return []; } }
 
 export function normalise(input = {}) {
@@ -256,11 +338,13 @@ export async function bulkDeleteContractors(ids) {
     const chunk = clean.slice(i, i + BATCH);
     const ph = chunk.map(() => '?').join(',');
     const rs = await b.batch([
+      { sql: `DELETE FROM whatsapp_check_jobs WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
+      { sql: `DELETE FROM whatsapp_checks WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM activities WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM tasks WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM contractors WHERE id IN (${ph})`, args: chunk, type: 'run' },
     ]);
-    deleted += rs[2].changes || 0;
+    deleted += rs[4].changes || 0;
   }
   return deleted;
 }
@@ -288,7 +372,7 @@ export async function bulkSetStage(ids, stage) {
 export async function getContractor(id) {
   const b = await ready();
   const [cRes, aRes, tRes] = await b.batch([
-    { sql: 'SELECT * FROM contractors WHERE id=?', args: [Number(id)] },
+    { sql: `${CONTRACTOR_SELECT} WHERE c.id=?`, args: [Number(id)] },
     { sql: 'SELECT * FROM activities WHERE contractor_id=? ORDER BY id DESC', args: [Number(id)] },
     { sql: 'SELECT * FROM tasks WHERE contractor_id=? ORDER BY done, due_date', args: [Number(id)] },
   ]);
@@ -301,13 +385,14 @@ export async function getContractor(id) {
 }
 
 export async function listContractors(filters = {}) {
-  let rows = (await many('SELECT * FROM contractors ORDER BY lead_score DESC, business_name')).map(row);
+  let rows = (await many(`${CONTRACTOR_SELECT} ORDER BY c.lead_score DESC, c.business_name`)).map(row);
   const q = (filters.q || '').toLowerCase();
   if (q) rows = rows.filter(r => [r.business_name, r.city, r.suburb, r.email, r.mobile, r.landline].join(' ').toLowerCase().includes(q));
   if (filters.state) rows = rows.filter(r => r.state === String(filters.state).toUpperCase());
   if (filters.city) rows = rows.filter(r => (r.city || '').toLowerCase().includes(String(filters.city).toLowerCase()));
   if (filters.niche) rows = rows.filter(r => r.niches.includes(filters.niche));
   if (filters.whatsapp_status) rows = rows.filter(r => r.whatsapp_status === filters.whatsapp_status);
+  if (filters.whatsapp_verification) rows = rows.filter(r => r.whatsapp_verification.status === filters.whatsapp_verification);
   if (filters.stage) rows = rows.filter(r => r.stage === filters.stage);
   if (filters.has_email) rows = rows.filter(r => !!r.email);
   if (filters.has_mobile) rows = rows.filter(r => !!(r.mobile || r.whatsapp_number));
@@ -326,6 +411,8 @@ export async function updateContractor(id, input) {
 }
 
 export async function deleteContractor(id) {
+  await run('DELETE FROM whatsapp_check_jobs WHERE contractor_id=?', [Number(id)]);
+  await run('DELETE FROM whatsapp_checks WHERE contractor_id=?', [Number(id)]);
   await run('DELETE FROM activities WHERE contractor_id=?', [Number(id)]);
   await run('DELETE FROM tasks WHERE contractor_id=?', [Number(id)]);
   const info = await run('DELETE FROM contractors WHERE id=?', [Number(id)]);

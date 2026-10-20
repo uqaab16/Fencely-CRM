@@ -115,6 +115,7 @@ export const api = {
     return json('/api/contractors' + (qs ? `?${qs}` : ''));
   },
   contractor: (id) => json(`/api/contractors/${id}`),
+  checkWhatsApp: (id) => json(`/api/contractors/${id}/whatsapp-check`, { method: 'POST' }),
   createContractor: (obj) => json('/api/contractors', { method: 'POST', body: obj }),
   updateContractor: (id, obj) => json(`/api/contractors/${id}`, { method: 'PUT', body: obj }),
   deleteContractor: (id) => json(`/api/contractors/${id}`, { method: 'DELETE' }),
