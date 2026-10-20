@@ -19,6 +19,7 @@ import * as auth from './auth.js';
 import { APP_NAME } from './config.js';
 import { toCsv, parseCsv, CSV_COLUMNS } from './csv.js';
 import { aiEnabled, explainScore, generateOutreachDraft, classifyNiches } from '../ai/claude.js';
+import { checkWhatsAppRegistration, gatewayConfigured, VERIFICATION_LABELS } from './whatsapp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Serve the built React app (web/dist) when it exists; fall back to the
@@ -59,6 +60,7 @@ async function readBody(req) {
 // implemented directly against the async db layer.
 // ---------------------------------------------------------------------------
 const MCP_TOOLS = [
+  { name: 'check_whatsapp', description: 'Check one contractor number using the configured WA-AKG gateway and save the result. Sends the number to your gateway; does not send a message or record marketing consent.', inputSchema: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
   { name: 'search_contractors', description: 'Search/list contractors with filters', inputSchema: { type: 'object', properties: { q: { type: 'string' }, state: { type: 'string' }, city: { type: 'string' }, niche: { type: 'string' }, whatsapp_status: { type: 'string' }, stage: { type: 'string' }, has_email: { type: 'boolean' }, has_mobile: { type: 'boolean' } } } },
   { name: 'get_contractor', description: 'Get one contractor with timeline + tasks', inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] } },
   { name: 'create_contractor', description: 'Create a contractor (de-dupe checked; set force:true to override)', inputSchema: { type: 'object', properties: { business_name: { type: 'string' }, state: { type: 'string' }, city: { type: 'string' }, suburb: { type: 'string' }, niches: { type: 'array', items: { type: 'string' } }, landline: { type: 'string' }, mobile: { type: 'string' }, whatsapp_number: { type: 'string' }, whatsapp_status: { type: 'string' }, email: { type: 'string' }, website: { type: 'string' }, source: { type: 'string' }, stage: { type: 'string' }, notes: { type: 'string' }, force: { type: 'boolean' } }, required: ['business_name'] } },
@@ -71,6 +73,11 @@ const MCP_TOOLS = [
 
 async function callMcpTool(name, args = {}) {
   switch (name) {
+    case 'check_whatsapp': {
+      const c = await db.getContractor(args.id);
+      if (!c) return { error: 'Not found' };
+      return db.saveWhatsAppCheck(c.id, await checkWhatsAppRegistration(c));
+    }
     case 'search_contractors': return db.listContractors(args);
     case 'get_contractor': return (await db.getContractor(args.id)) || { error: 'Not found' };
     case 'create_contractor': {
@@ -241,6 +248,13 @@ export default async function handler(req, res) {
       if (!user) return send(res, 401, { error: 'Unauthorized' });
 
       if (p === '/api/auth/me' && req.method === 'GET') return send(res, 200, { email: user.email });
+      if (p === '/api/whatsapp/config' && req.method === 'GET') return send(res, 200, { configured: gatewayConfigured(), statuses: VERIFICATION_LABELS });
+      const waCheck = p.match(/^\/api\/contractors\/(\d+)\/whatsapp-check$/);
+      if (waCheck && req.method === 'POST') {
+        const c = await db.getContractor(waCheck[1]);
+        if (!c) return send(res, 404, { error: 'Not found' });
+        return send(res, 200, await db.saveWhatsAppCheck(c.id, await checkWhatsAppRegistration(c)));
+      }
       if (p === '/api/stats') return send(res, 200, await db.stats());
       if (p === '/api/meta') return send(res, 200, { appName: APP_NAME, stages: db.STAGES, niches: db.NICHES, waStatuses: db.WA_STATUSES, csvColumns: CSV_COLUMNS });
 
@@ -335,6 +349,6 @@ export default async function handler(req, res) {
     res.writeHead(200, { 'content-type': types[path.extname(fp)] || 'text/plain' });
     return res.end(fs.readFileSync(fp));
   } catch (e) {
-    return send(res, 500, { error: String(e?.message || e) });
+    return send(res, e.statusCode || 500, { error: String(e?.message || e) });
   }
 }

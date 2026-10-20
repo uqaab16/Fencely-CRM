@@ -14,6 +14,12 @@ const LOG_BUTTONS = [
   { channel: 'email', label: '✉️ Emailed' },
 ];
 
+const WA_CHECK_LABELS = {
+  not_checked: 'Not checked', available: 'WhatsApp available',
+  not_found: 'WhatsApp not found — unconfirmed', invalid: 'Invalid or missing number',
+  check_failed: 'Check failed — retry later',
+};
+
 // Contractor detail drawer (GET /api/contractors/:id → record + activities + tasks).
 // Main job: make it one-tap to record outside-CRM contact (📞/💬/✉️ quick-log),
 // see last contacted / next follow-up / the open follow-up task, and mark
@@ -34,6 +40,7 @@ export default function Drawer({ id, meta, refreshTick, onClose, onEdit, onDelet
   const [taskTitle, setTaskTitle] = useState('');
   const [taskDue, setTaskDue] = useState('');
   const [taskBusy, setTaskBusy] = useState(false);
+  const [waBusy, setWaBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -127,6 +134,19 @@ export default function Drawer({ id, meta, refreshTick, onClose, onEdit, onDelet
       toast('error', err.message);
     } finally {
       setDraftBusy(false);
+    }
+  }
+
+  async function checkWhatsApp() {
+    setWaBusy(true);
+    try {
+      const updated = await api.checkWhatsApp(id);
+      toast('success', WA_CHECK_LABELS[updated.whatsapp_verification?.status] || 'Check saved');
+      changed();
+    } catch (err) {
+      toast('error', err.message);
+    } finally {
+      setWaBusy(false);
     }
   }
 
@@ -344,6 +364,19 @@ export default function Drawer({ id, meta, refreshTick, onClose, onEdit, onDelet
             <p className="notes-text">{c.notes}</p>
           </>
         )}
+      </div>
+
+      <div className="drawer-section" aria-live="polite">
+        <h3>WhatsApp number check</h3>
+        <p>{WA_CHECK_LABELS[c.whatsapp_verification?.status || 'not_checked']}</p>
+        {c.whatsapp_verification?.checked_at && (
+          <p className="muted small">{c.whatsapp_verification.number || 'No valid number'} · {new Date(c.whatsapp_verification.checked_at).toLocaleString()}</p>
+        )}
+        {c.whatsapp_verification?.detail && <p className="muted small">{c.whatsapp_verification.detail}</p>}
+        <button className="btn" onClick={checkWhatsApp} disabled={waBusy}>
+          {waBusy ? 'Checking…' : 'Check WhatsApp'}
+        </button>
+        <p className="muted small">Checks registration without sending a message. Registration does not establish marketing permission.</p>
       </div>
 
       {/* Actions */}

@@ -17,6 +17,11 @@ Copy `.env.example` → `.env` if you want Claude AI features (optional — ever
 
 ## Features
 
+- **WhatsApp registration checks (stage 1)** — check a number from its detail
+  drawer or the `check_whatsapp` MCP tool, with saved results and uncertain/error
+  handling. Requires your connected WA-AKG gateway; does not send messages.
+  See [setup and remaining campaign work](docs/whatsapp-setup.md).
+
 - **Dashboard stats** — total, WhatsApp-advertised, contacted / replied / interested, follow-ups due
 - **Contractors grid** — search + filters: `state`, `city`, niche, WhatsApp status, pipeline stage, has email / has mobile
 - **Kanban pipeline** — New → Researched → Ready to Contact → Contacted → Follow-up Due → Replied → Interested → Trial/Demo → Customer, plus Do Not Contact

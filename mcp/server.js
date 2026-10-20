@@ -8,11 +8,19 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as db from '../src/db.js';
+import { checkWhatsAppRegistration } from '../src/whatsapp.js';
 
 await db.init();
 
 const server = new McpServer({ name: 'fencely-crm', version: '1.1.0' });
 const txt = obj => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
+
+server.tool('check_whatsapp', 'Check one contractor number via your configured WA-AKG gateway and save the result. Does not send a message or record marketing consent.', { id: z.number().int().positive() },
+  async ({ id }) => {
+    const c = await db.getContractor(id);
+    if (!c) return txt({ error: 'Not found' });
+    return txt(await db.saveWhatsAppCheck(id, await checkWhatsAppRegistration(c)));
+  });
 
 server.tool('search_contractors', 'Search/list contractors with filters',
   { q: z.string().optional(), state: z.string().optional(), city: z.string().optional(), niche: z.string().optional(), whatsapp_status: z.string().optional(), stage: z.string().optional(), has_email: z.boolean().optional(), has_mobile: z.boolean().optional() },
