@@ -75,3 +75,21 @@ MCP tools (refresh the Claude connector list after deployment): prepare_whatsapp
 New tables: whatsapp_preparations and whatsapp_preparation_items. Read-only checks use leased tokens; old leases/results cannot overwrite a replacement. Final lists revalidate phone snapshots and suppression/reply/send eligibility when read, removing stale entries. If a previously completed list is shortened while more candidates remain, its status becomes needs_refresh; request a new scan. The candidate pool is fixed when created; later imports need a new scan.
 
 The existing private-worker.py and registration service remain compatible without installation changes (approximately one checked number per minute). The updated optional worker reduces the pause to five seconds after each successful acknowledgement while retaining 60-second idle/error waits. No parallel gateway checks or new sending capability is added. Existing worker.env, secrets, gateway session and service unit are reused.
+
+### Full CRM registration scan
+
+In Campaigns choose **Scan all CRM contacts**, or call `prepare_whatsapp_list` with
+`{ "scope": "all" }`. The durable preparation snapshots all current contractor IDs,
+ignores phone-type labels, and continues to the end rather than stopping at 20.
+Existing exclusions (opt-outs, replies, prior send attempts), invalid numbers and
+same-job duplicate numbers remain excluded. One valid primary phone is checked per
+contractor. City and state are returned from CRM records; no suburb/region inference
+is performed. Repeated clicks reuse the active full scan. New imports need another
+scan after completion. Available/not_found results for the unchanged phone from
+the last seven days are reused; failed, stale and changed-phone checks are retried.
+This cache is for list preparation only: the sender still checks registration
+immediately before its send permit. Scan completion is reported as `exhausted`
+(the candidate pool is finished), even if more than 20 numbers were available.
+The private registration worker in this revision waits five seconds after a saved
+check and sixty seconds when idle or on errors. Older one-minute workers remain
+compatible but are slower. No campaign, message or consent record is created.

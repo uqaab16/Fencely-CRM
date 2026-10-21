@@ -15,7 +15,7 @@ await db.init();
 const server = new McpServer({ name: 'fencely-crm', version: '1.1.0' });
 const txt = obj => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
 
-server.tool('prepare_whatsapp_list', 'Start read-only city scanning until target available numbers are found. Ignore phone-type labels; never send. Poll get_whatsapp_preparation. Availability is not consent.', { city: z.string(), state: z.string().optional(), target: z.number().int().min(1).max(20).optional() },
+server.tool('prepare_whatsapp_list', 'Start read-only city scanning until target available numbers are found. Ignore phone-type labels; never send. Poll get_whatsapp_preparation. Availability is not consent.', { scope: z.enum(['city','all']).optional(), city: z.string().optional(), state: z.string().optional(), target: z.number().int().min(1).max(20).optional() },
   async (input) => { if (!bridgeConfigured()) throw new Error('Private registration worker is not configured.'); return txt(await db.createWhatsAppPreparation(input)); });
 server.tool('get_whatsapp_preparation', 'Read city scan progress and verified list. Exhausted may contain fewer than target; do not invent contacts.', { id: z.string() },
   async ({ id }) => txt(await db.getWhatsAppPreparation(id)));
