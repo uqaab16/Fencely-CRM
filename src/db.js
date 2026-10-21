@@ -133,6 +133,28 @@ const SCHEMA = [
   lease_until INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
 )`,
+`CREATE TABLE IF NOT EXISTS whatsapp_suppressions (
+  number TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL
+)`,
+`CREATE TABLE IF NOT EXISTS whatsapp_inbox (
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  number TEXT NOT NULL,
+  text TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  processed INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(session_id,message_id)
+)`,
+`CREATE INDEX IF NOT EXISTS idx_whatsapp_inbox_number ON whatsapp_inbox(number)`,
+`CREATE TABLE IF NOT EXISTS whatsapp_inbox_targets (
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  contractor_id INTEGER NOT NULL REFERENCES contractors(id) ON DELETE CASCADE,
+  PRIMARY KEY(session_id,message_id,contractor_id)
+)`,
 ];
 
 async function createSchema(backend) {
@@ -255,6 +277,49 @@ export async function finishWhatsAppCheck(id, token, result) {
   }
 }
 
+
+export async function getWhatsAppOutreachState(number) {
+  const state = await one(`SELECT
+    EXISTS(SELECT 1 FROM whatsapp_suppressions WHERE number=?) AS suppressed,
+    EXISTS(SELECT 1 FROM whatsapp_inbox WHERE number=?) AS followup_paused`, [number || '', number || '']);
+  return { suppressed: !!state.suppressed, followup_paused: !!state.followup_paused };
+}
+
+export async function recordWhatsAppReply(event) {
+  const { session_id, message_id, number, text, kind, received_at } = event;
+  // Suppression is number-wide and durable, including STOP from unknown leads.
+  // Persist it first. Every subsequent stage UPDATE consults this table in SQL,
+  // so concurrent/late ordinary replies can never undo an opt-out.
+  if (kind === 'stop') await run(`INSERT INTO whatsapp_suppressions (number,reason,created_at)
+    VALUES (?,'WhatsApp opt-out',?) ON CONFLICT(number) DO NOTHING`, [number, received_at]);
+  const matches = (await many('SELECT id,whatsapp_number,mobile,landline FROM contractors'))
+    .filter(c => contractorWhatsAppNumber(c) === number);
+  if (!matches.length && kind !== 'stop') return { ok: true, ignored: true };
+  await run(`INSERT INTO whatsapp_inbox (session_id,message_id,number,text,kind,received_at)
+    VALUES (?,?,?,?,?,?) ON CONFLICT(session_id,message_id) DO NOTHING`,
+    [session_id, message_id, number, text, kind, received_at]);
+  const stored = await one('SELECT * FROM whatsapp_inbox WHERE session_id=? AND message_id=?', [session_id, message_id]);
+  if (stored.number !== number || stored.text !== text || stored.kind !== kind) {
+    const e = new Error('Conflicting message ID'); e.statusCode = 409; throw e;
+  }
+  if (stored.processed) return { ok: true, duplicate: true };
+  for (const c of matches) {
+    // Each operation is idempotent. The inbox acts as a durable receipt; retries
+    // resume incomplete work instead of duplicating the timeline or undoing STOP.
+    await run(`INSERT INTO whatsapp_inbox_targets (session_id,message_id,contractor_id)
+      SELECT ?,?,id FROM contractors WHERE id=? ON CONFLICT DO NOTHING`, [session_id, message_id, c.id]);
+    await run(`UPDATE contractors SET stage=CASE
+      WHEN stage='Do Not Contact' OR EXISTS(SELECT 1 FROM whatsapp_suppressions WHERE number=?) THEN 'Do Not Contact'
+      WHEN ?='interested' AND stage NOT IN ('Trial/Demo','Customer') THEN 'Interested'
+      WHEN stage IN ('New','Researched','Ready to Contact','Contacted','Follow-up Due') THEN 'Replied'
+      ELSE stage END,next_followup='',updated_at=datetime('now') WHERE id=?`, [number, kind, c.id]);
+    await run(`UPDATE tasks SET done=1 WHERE contractor_id=? AND done=0
+      AND title LIKE 'Follow up with %'`, [c.id]);
+  }
+  await run('UPDATE whatsapp_inbox SET processed=1 WHERE session_id=? AND message_id=?', [session_id, message_id]);
+  return { ok: true, matched: matches.length };
+}
+
 function safeJson(v) { try { const x = JSON.parse(v || '[]'); return Array.isArray(x) ? x : []; } catch { return []; } }
 
 export function normalise(input = {}) {
@@ -338,13 +403,14 @@ export async function bulkDeleteContractors(ids) {
     const chunk = clean.slice(i, i + BATCH);
     const ph = chunk.map(() => '?').join(',');
     const rs = await b.batch([
+      { sql: `DELETE FROM whatsapp_inbox_targets WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM whatsapp_check_jobs WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM whatsapp_checks WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM activities WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM tasks WHERE contractor_id IN (${ph})`, args: chunk, type: 'run' },
       { sql: `DELETE FROM contractors WHERE id IN (${ph})`, args: chunk, type: 'run' },
     ]);
-    deleted += rs[4].changes || 0;
+    deleted += rs[5].changes || 0;
   }
   return deleted;
 }
@@ -371,15 +437,22 @@ export async function bulkSetStage(ids, stage) {
 
 export async function getContractor(id) {
   const b = await ready();
-  const [cRes, aRes, tRes] = await b.batch([
+  const [cRes, aRes, tRes, inboxRes] = await b.batch([
     { sql: `${CONTRACTOR_SELECT} WHERE c.id=?`, args: [Number(id)] },
     { sql: 'SELECT * FROM activities WHERE contractor_id=? ORDER BY id DESC', args: [Number(id)] },
     { sql: 'SELECT * FROM tasks WHERE contractor_id=? ORDER BY done, due_date', args: [Number(id)] },
+    { sql: `SELECT i.* FROM whatsapp_inbox i JOIN whatsapp_inbox_targets t
+      ON i.session_id=t.session_id AND i.message_id=t.message_id WHERE t.contractor_id=? ORDER BY i.received_at DESC`, args: [Number(id)] },
   ]);
   const r = cRes.rows[0];
   if (!r) return null;
   const out = row(r);
-  out.activities = aRes.rows;
+  out.activities = [...aRes.rows, ...inboxRes.rows.map(i => ({
+    id: `wa:${i.session_id}:${i.message_id}`, contractor_id: Number(id),
+    type: i.kind === 'stop' ? 'whatsapp-opt-out' : i.kind === 'interested' ? 'whatsapp-interested' : 'whatsapp-reply',
+    body: i.text || '[Non-text WhatsApp reply]', created_at: i.received_at,
+  }))].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  out.whatsapp_outreach = await getWhatsAppOutreachState(contractorWhatsAppNumber(r));
   out.tasks = tRes.rows.map(t => ({ ...t, done: !!t.done }));
   return out;
 }
@@ -411,6 +484,7 @@ export async function updateContractor(id, input) {
 }
 
 export async function deleteContractor(id) {
+  await run('DELETE FROM whatsapp_inbox_targets WHERE contractor_id=?', [Number(id)]);
   await run('DELETE FROM whatsapp_check_jobs WHERE contractor_id=?', [Number(id)]);
   await run('DELETE FROM whatsapp_checks WHERE contractor_id=?', [Number(id)]);
   await run('DELETE FROM activities WHERE contractor_id=?', [Number(id)]);
