@@ -74,6 +74,12 @@ async function json(path, opts) {
 }
 
 export const api = {
+  campaignConfig: () => json('/api/campaigns/config'),
+  startCampaign: (id, revision, consent_confirmed) => json(`/api/campaigns/${id}/start`, { method: 'POST', body: { revision, consent_confirmed } }),
+  pauseCampaign: (id) => json(`/api/campaigns/${id}/pause`, { method: 'POST', body: {} }),
+  campaigns: () => json('/api/campaigns'),
+  campaign: (id) => json(`/api/campaigns/${id}`),
+  saveCampaign: (body) => json('/api/campaigns', { method: 'POST', body }),
   health: () => json('/api/health'),
   meta: () => json('/api/meta'),
   stats: () => json('/api/stats'),

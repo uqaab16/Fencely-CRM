@@ -8,6 +8,7 @@ import {
   clearSession,
   setUnauthorizedHandler,
 } from './api';
+import Campaigns from './components/Campaigns';
 import Login from './components/Login';
 import StatsStrip from './components/StatsStrip';
 import Filters from './components/Filters';
@@ -368,6 +369,7 @@ export default function App() {
             ['table', 'Table'],
             ['kanban', 'Pipeline'],
             ['tasks', 'Follow-ups'],
+            ['campaigns', 'Campaigns'],
           ].map(([v, label]) => (
             <button key={v} className={view === v ? 'active' : ''} onClick={() => setView(v)}>
               {label}
@@ -397,7 +399,7 @@ export default function App() {
 
       <StatsStrip stats={stats} onStageClick={openStageInPipeline} />
 
-      <Filters
+      {view !== 'campaigns' && <Filters
         filters={filters}
         setFilters={setFilters}
         meta={meta}
@@ -410,9 +412,10 @@ export default function App() {
         onImport={handleImport}
         onTemplate={handleTemplate}
         busy={loadingList}
-      />
+      />}
 
       <main className="main">
+        {view === 'campaigns' && <Campaigns toast={toast} />}
         {selected.length > 0 && view === 'table' && (
           <div className="bulk-bar" role="toolbar" aria-label="Bulk actions">
             <b>{selected.length}</b>&nbsp;selected

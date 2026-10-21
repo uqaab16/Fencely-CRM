@@ -23,6 +23,7 @@ import { gatewayConfigured, VERIFICATION_LABELS } from './whatsapp.js';
 
 import { requestWhatsAppCheck, bridgeConfigured } from './wa-service.js';
 import { bridgeAuthorized, bridgeResult } from './wa-bridge.js';
+import { senderAuthorized } from './wa-sender-auth.js';
 import { readWebhookBody, verifyWebhook, parseWebhook } from './wa-webhook.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -64,6 +65,9 @@ async function readBody(req) {
 // implemented directly against the async db layer.
 // ---------------------------------------------------------------------------
 const MCP_TOOLS = [
+  { name: 'list_campaigns', description: 'List saved WhatsApp draft campaigns. Does not send messages.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'get_campaign', description: 'Read a campaign and its reviewed drafts.', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+  { name: 'save_campaign_drafts', description: 'Only after the user explicitly says to add their reviewed messages to CRM: save 1–20 drafts together. Show all drafts in chat for review first. Never sends or starts a campaign. Supply id and revision to replace existing drafts.', inputSchema: { type: 'object', properties: { id: { type: 'string' }, revision: { type: 'integer' }, name: { type: 'string' }, schedule: { type: 'object', properties: { timeZone: { type: 'string' }, startHour: { type: 'integer' }, dailyLimit: { type: 'integer' } }, required: ['timeZone'] }, drafts: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: { contractor_id: { type: 'integer' }, message: { type: 'string' } }, required: ['contractor_id', 'message'] } } }, required: ['name', 'schedule', 'drafts'] } },
   { name: 'check_whatsapp', description: 'Check one contractor number using the configured WA-AKG gateway and save the result. Sends the number to your gateway; does not send a message or record marketing consent.', inputSchema: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] } },
   { name: 'search_contractors', description: 'Search/list contractors with filters', inputSchema: { type: 'object', properties: { q: { type: 'string' }, state: { type: 'string' }, city: { type: 'string' }, niche: { type: 'string' }, whatsapp_status: { type: 'string' }, stage: { type: 'string' }, has_email: { type: 'boolean' }, has_mobile: { type: 'boolean' } } } },
   { name: 'get_contractor', description: 'Get one contractor with timeline + tasks', inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] } },
@@ -77,6 +81,9 @@ const MCP_TOOLS = [
 
 async function callMcpTool(name, args = {}) {
   switch (name) {
+    case 'list_campaigns': return db.listCampaigns();
+    case 'get_campaign': return db.getCampaign(args.id);
+    case 'save_campaign_drafts': return db.saveCampaignDrafts(args);
     case 'check_whatsapp': {
       const c = await db.getContractor(args.id);
       if (!c) return { error: 'Not found' };
@@ -255,6 +262,17 @@ export default async function handler(req, res) {
       return send(res, 200, await db.recordWhatsAppReply(event));
     }
 
+    if (p.startsWith('/api/whatsapp/sender/')) {
+      if (!senderAuthorized(req)) return send(res, 401, { error: 'Unauthorized' });
+      if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
+      if (p === '/api/whatsapp/sender/claim') return send(res, 200, { job: await db.claimDispatch() });
+      const b = await readBody(req);
+      if (typeof b.id !== 'string' || typeof b.token !== 'string') return send(res, 400, { error: 'Invalid dispatch receipt' });
+      if (p === '/api/whatsapp/sender/authorize') return send(res, 200, await db.authorizeDispatch(b));
+      if (p === '/api/whatsapp/sender/result') return send(res, 200, await db.finishDispatch(b));
+      return send(res, 404, { error: 'Not found' });
+    }
+
     // Dedicated, limited worker credential; never accepts a login/MCP token.
     if (p.startsWith('/api/whatsapp/bridge/')) {
       if (!bridgeAuthorized(req)) return send(res, 401, { error: 'Unauthorized' });
@@ -274,6 +292,18 @@ export default async function handler(req, res) {
       const user = auth.authUser(req);
       if (!user) return send(res, 401, { error: 'Unauthorized' });
 
+      if (p === '/api/campaigns/config' && req.method === 'GET') return send(res, 200, { mode: db.senderMode() });
+      const campaignAction = p.match(/^\/api\/campaigns\/([a-f0-9-]+)\/(start|pause)$/);
+      if (campaignAction && req.method === 'POST') {
+        const b = await readBody(req);
+        return send(res, 200, campaignAction[2] === 'start'
+          ? await db.startCampaign(campaignAction[1], b.revision, b.consent_confirmed, user.email)
+          : await db.pauseCampaign(campaignAction[1]));
+      }
+      if (p === '/api/campaigns' && req.method === 'GET') return send(res, 200, await db.listCampaigns());
+      if (p === '/api/campaigns' && req.method === 'POST') return send(res, 200, await db.saveCampaignDrafts(await readBody(req)));
+      const campaignMatch = p.match(/^\/api\/campaigns\/([a-f0-9-]+)$/);
+      if (campaignMatch && req.method === 'GET') return send(res, 200, await db.getCampaign(campaignMatch[1]));
       if (p === '/api/auth/me' && req.method === 'GET') return send(res, 200, { email: user.email });
       if (p === '/api/whatsapp/config' && req.method === 'GET') return send(res, 200, { configured: bridgeConfigured() || gatewayConfigured(), mode: bridgeConfigured() ? 'private-bridge' : 'direct', statuses: VERIFICATION_LABELS });
       const waCheck = p.match(/^\/api\/contractors\/(\d+)\/whatsapp-check$/);
