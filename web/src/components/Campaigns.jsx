@@ -49,6 +49,9 @@ export default function Campaigns({ toast }) {
     {campaign && <div>
       <h3>{campaign.name} · {campaign.state}</h3>
       <p>Monday–Friday · maximum {campaign.schedule.dailyLimit}/day · 12-hour window</p>
+      <label>Earliest sending date <input type="date" disabled={!editable || busy} value={campaign.schedule.startDate || ''}
+        onChange={e => setCampaign(c => ({ ...c, schedule: { ...c.schedule, startDate: e.target.value } }))} /></label>
+      <p>{campaign.schedule.startDate ? `No sends before ${campaign.schedule.startDate} in ${campaign.schedule.timeZone}. Weekdays and the selected daily window still apply.` : 'No date restriction: Start permits sending during the next eligible window.'}</p>
       <label>Recipient time zone <select disabled={!editable || busy} value={campaign.schedule.timeZone}
         onChange={e => setCampaign(c => ({ ...c, schedule: { ...c.schedule, timeZone: e.target.value } }))}>
         {[...new Set([...ZONES, campaign.schedule.timeZone])].map(zone => <option key={zone}>{zone}</option>)}

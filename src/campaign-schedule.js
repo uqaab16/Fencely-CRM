@@ -15,6 +15,12 @@ export function validateCampaignSchedule(input = {}) {
     throw new Error('Campaign days must be Monday to Friday.');
   if (typeof schedule.timeZone !== 'string' || !schedule.timeZone.startsWith('Australia/'))
     throw new Error('Choose an Australian recipient time zone.');
+  if (schedule.startDate !== undefined && schedule.startDate !== '') {
+    if (typeof schedule.startDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(schedule.startDate) ||
+        !Number.isFinite(Date.parse(schedule.startDate + 'T00:00:00Z')) ||
+        new Date(schedule.startDate + 'T00:00:00Z').toISOString().slice(0,10) !== schedule.startDate)
+      throw new Error('Start date must be a valid YYYY-MM-DD date.');
+  }
   // Intl uses the zone rules for the actual date, including daylight saving.
   new Intl.DateTimeFormat('en', { timeZone: schedule.timeZone }).format(new Date());
   return { ...schedule, weekdays: [...new Set(schedule.weekdays)].sort() };
@@ -27,11 +33,13 @@ export function campaignSlotAt(instant, input) {
     timeZone: s.timeZone, weekday: 'short', year: 'numeric', month: '2-digit',
     day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
   }).formatToParts(date).map(p => [p.type, p.value]));
+  const localDate = `${parts.year}-${parts.month}-${parts.day}`;
+  if (s.startDate && localDate < s.startDate) return null;
   const weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(parts.weekday);
   const seconds = Number(parts.hour) * 3600 + Number(parts.minute) * 60 + Number(parts.second);
   const elapsed = seconds - s.startHour * 3600;
   if (!s.weekdays.includes(weekday) || elapsed < 0 || elapsed >= s.windowHours * 3600) return null;
   const slot = Math.floor(elapsed / (s.windowHours * 3600 / s.dailyLimit));
-  return { localDate: `${parts.year}-${parts.month}-${parts.day}`, slot,
+  return { localDate, slot,
     key: `${s.timeZone}:${parts.year}-${parts.month}-${parts.day}:${slot}` };
 }

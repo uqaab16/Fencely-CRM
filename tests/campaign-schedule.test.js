@@ -23,3 +23,16 @@ test('rejects invalid limits, weekend days, zones and overnight windows', () => 
     { weekdays: [] }, { startHour: 13 }, { windowHours: 13 }, { timeZone: 'UTC' }])
     assert.throws(() => validateCampaignSchedule({ ...perth, ...change }));
 });
+
+
+test('future start date blocks today in recipient local time, including Melbourne UTC crossover', () => {
+  const future = { ...perth, startDate: '2026-10-22' };
+  assert.equal(campaignSlotAt('2026-10-21T00:00:00Z', future), null);
+  assert.equal(campaignSlotAt('2026-10-22T00:00:00Z', future).slot, 0);
+  assert.equal(campaignSlotAt('2026-10-23T00:00:00Z', future).slot, 0);
+  const melbourne = { timeZone: 'Australia/Melbourne', startDate: '2026-10-22' };
+  assert.equal(campaignSlotAt('2026-10-21T08:00:00Z', melbourne), null);
+  assert.equal(campaignSlotAt('2026-10-21T21:00:00Z', melbourne).localDate, '2026-10-22');
+  for (const startDate of ['2026-02-30','2026-13-01','22/10/2026',20261022])
+    assert.throws(() => validateCampaignSchedule({ ...perth, startDate }), /Start date/);
+});

@@ -56,3 +56,8 @@ Clear requests such as 'Stop texting me', 'Do not message me again', 'Unsubscrib
 The tracked dummy SQLite database/WAL/SHM files are removed from the current repository tree, while local copies remain on disk and ignored. Git history is not rewritten. Production Turso data is untouched.
 
 Automated checks additionally simulate next-weekday continuation and reopen the SQLite database in a separate Node process to verify completion/no replay after restart. This is not a real Hostinger reboot or a days-long WhatsApp pilot. Real multi-recipient spacing, the new gateway-health report and VPS restart behaviour still need controlled operational validation using eligible personal test numbers. Preserve all existing opt-outs.
+
+
+## Future campaign dates
+
+`schedule.startDate` optionally sets the earliest eligible date as YYYY-MM-DD in the recipient time zone. Campaigns exposes this as Earliest sending date, and both MCP variants accept the field. Clicking Start before that date activates the queue but does not authorize sending before the selected local date/window. Weekday rules and global rate limits continue to apply. An omitted/blank date preserves existing behaviour. This is a start-date restriction, not an end date; remaining messages may continue on later weekdays.
