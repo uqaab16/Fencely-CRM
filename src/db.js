@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTursoClient } from './turso.js';
+import { validateCampaignSchedule } from './campaign-schedule.js';
 import { STAGES, NICHES, FIT_NICHES } from './config.js';
 import { contractorWhatsAppNumber, VERIFICATION_LABELS } from './whatsapp.js';
 
@@ -68,6 +69,11 @@ async function createLocalBackend() {
 }
 
 const SCHEMA = [
+`CREATE TABLE IF NOT EXISTS whatsapp_campaigns (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule TEXT NOT NULL,
+  drafts TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+  state TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL
+)`,
 `CREATE TABLE IF NOT EXISTS contractors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   business_name TEXT NOT NULL,
@@ -654,4 +660,56 @@ export async function seedIfEmpty() {
   const first = (await listContractors())[0];
   if (first) await createTask({ contractor_id: first.id, title: 'SAMPLE follow-up task (dummy)', due_date: new Date().toISOString().slice(0,10) });
   return samples.length;
+}
+
+
+// A campaign is saved atomically as one revision. MCP can save drafts, never start sends.
+function campaignError(message, statusCode = 400) {
+  return Object.assign(new Error(message), { statusCode });
+}
+export async function getCampaign(id) {
+  const row = await one('SELECT * FROM whatsapp_campaigns WHERE id=?', [String(id)]);
+  if (!row) throw campaignError('Campaign not found.', 404);
+  return { ...row, schedule: JSON.parse(row.schedule), drafts: JSON.parse(row.drafts) };
+}
+export async function listCampaigns() {
+  return (await many('SELECT id,name,state,revision,created_at FROM whatsapp_campaigns ORDER BY created_at DESC'));
+}
+export async function saveCampaignDrafts(input) {
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  if (!name || name.length > 120) throw campaignError('Campaign name must be 1–120 characters.');
+  let schedule;
+  try { schedule = validateCampaignSchedule(input.schedule); }
+  catch (e) { throw campaignError(e.message); }
+  if (!Array.isArray(input.drafts) || !input.drafts.length || input.drafts.length > 20)
+    throw campaignError('Save between 1 and 20 reviewed drafts.');
+  const ids = new Set(), numbers = new Set(), drafts = [];
+  for (const draft of input.drafts) {
+    if (!Number.isSafeInteger(draft.contractor_id) || draft.contractor_id < 1 || ids.has(draft.contractor_id))
+      throw campaignError('Each draft must have a different valid contractor ID.');
+    if (typeof draft.message !== 'string' || !draft.message.trim() || draft.message.length > 4000)
+      throw campaignError('Each message must be 1–4000 characters.');
+    const c = await getContractor(draft.contractor_id);
+    if (!c) throw campaignError('A selected contractor no longer exists.');
+    const number = contractorWhatsAppNumber(c);
+    if (!number || numbers.has(number)) throw campaignError('Missing, invalid or duplicate recipient number.');
+    const outreach = await getWhatsAppOutreachState(number);
+    if (c.stage === 'Do Not Contact' || outreach.suppressed || outreach.followup_paused)
+      throw campaignError('A selected recipient opted out or has already replied. Remove them from this campaign.');
+    ids.add(c.id); numbers.add(number);
+    drafts.push({ contractor_id: c.id, business_name: c.business_name, number,
+      message: draft.message.trim(), status: 'draft' });
+  }
+  if (input.id) {
+    if (!Number.isSafeInteger(input.revision)) throw campaignError('Reload the campaign before editing.', 409);
+    const result = await run(`UPDATE whatsapp_campaigns SET name=?,schedule=?,drafts=?,revision=revision+1
+      WHERE id=? AND revision=? AND state='draft'`,
+      [name, JSON.stringify(schedule), JSON.stringify(drafts), String(input.id), input.revision]);
+    if (!result.changes) throw campaignError('Campaign changed. Reload before saving.', 409);
+    return getCampaign(input.id);
+  }
+  const id = randomUUID();
+  await run('INSERT INTO whatsapp_campaigns(id,name,schedule,drafts,created_at) VALUES(?,?,?,?,?)',
+    [id, name, JSON.stringify(schedule), JSON.stringify(drafts), new Date().toISOString()]);
+  return getCampaign(id);
 }

@@ -74,6 +74,9 @@ async function json(path, opts) {
 }
 
 export const api = {
+  campaigns: () => json('/api/campaigns'),
+  campaign: (id) => json(`/api/campaigns/${id}`),
+  saveCampaign: (body) => json('/api/campaigns', { method: 'POST', body }),
   health: () => json('/api/health'),
   meta: () => json('/api/meta'),
   stats: () => json('/api/stats'),
