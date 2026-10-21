@@ -18,6 +18,27 @@ def post(url, body, headers):
     with urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
         return json.load(response)
 
+def get(url, headers):
+    request = urllib.request.Request(url, headers=headers, method='GET')
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
+        return json.load(response)
+
+def gateway_status(key, session, request=get):
+    try:
+        response = request('http://127.0.0.1:3300/api/sessions', {'X-API-Key': key})
+        if response.get('status') is not True:
+            return 'unknown'
+        item = next((s for s in response.get('data', []) if s.get('sessionId') == session), None)
+        if not item:
+            return 'unknown'
+        if item.get('status') == 'CONNECTED':
+            return 'connected'
+        if item.get('status') in ('DISCONNECTED', 'ZOMBIE'):
+            return 'disconnected'
+    except Exception:
+        pass
+    return 'unknown'
+
 def write_receipt(path, receipt):
     temporary = path.with_suffix('.tmp')
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -99,12 +120,22 @@ def run():
         raise ValueError('Sender credentials missing')
     journal = Path('/var/lib/fencely-sender/receipt.json')
     headers = {'Authorization': 'Bearer ' + secret}
+    error_code = 'none'
     while True:
         try:
-            tick(origin, headers, key, session, journal)
+            status = gateway_status(key, session)
+            post(origin + '/api/whatsapp/sender/heartbeat', {
+                'gateway': status, 'pending': journal.exists(), 'error': error_code,
+            }, headers)
+            # Always reconcile existing receipts, even with WhatsApp disconnected.
+            if journal.exists() or status == 'connected':
+                tick(origin, headers, key, session, journal)
+            error_code = 'none'
         except urllib.error.HTTPError as error:
+            error_code = 'crm_error'
             print('CRM HTTP error:', error.code, flush=True)
         except Exception:
+            error_code = 'worker_error'
             print('Sender waiting for connection; no send retry', flush=True)
         time.sleep(60)
 

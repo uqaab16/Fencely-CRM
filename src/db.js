@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTursoClient } from './turso.js';
+import { normaliseSender, campaignMessage, assertCampaignContent } from './campaign-content.js';
 import { campaignSlotAt, validateCampaignSchedule } from './campaign-schedule.js';
 import { STAGES, NICHES, FIT_NICHES } from './config.js';
 import { contractorWhatsAppNumber, VERIFICATION_LABELS } from './whatsapp.js';
@@ -69,6 +70,10 @@ async function createLocalBackend() {
 }
 
 const SCHEMA = [
+`CREATE TABLE IF NOT EXISTS whatsapp_sender_health (
+ id INTEGER PRIMARY KEY CHECK(id=1), reported_at INTEGER NOT NULL,
+ gateway TEXT NOT NULL, pending INTEGER NOT NULL, error TEXT NOT NULL
+)`,
 `CREATE TABLE IF NOT EXISTS whatsapp_campaign_approvals (
  id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, revision INTEGER NOT NULL,
  approved_by TEXT NOT NULL, approved_at TEXT NOT NULL
@@ -690,7 +695,8 @@ function campaignError(message, statusCode = 400) {
 export async function getCampaign(id) {
   const row = await one('SELECT * FROM whatsapp_campaigns WHERE id=?', [String(id)]);
   if (!row) throw campaignError('Campaign not found.', 404);
-  return { ...row, schedule: JSON.parse(row.schedule), drafts: JSON.parse(row.drafts),
+  const drafts = JSON.parse(row.drafts);
+  return { ...row, schedule: JSON.parse(row.schedule), sender: drafts[0]?.sender || { name: '', business: 'Fencely', contact: '' }, drafts,
     deliveries: await many('SELECT id,contractor_id,state,detail,message_id,confirmed_at FROM whatsapp_dispatch WHERE campaign_id=? ORDER BY id', [String(id)]) };
 }
 export async function listCampaigns() {
@@ -704,6 +710,8 @@ export async function saveCampaignDrafts(input) {
   catch (e) { throw campaignError(e.message); }
   if (!Array.isArray(input.drafts) || !input.drafts.length || input.drafts.length > 20)
     throw campaignError('Save between 1 and 20 reviewed drafts.');
+  let sender;
+  try { sender = normaliseSender(input.sender); } catch (e) { throw campaignError(e.message); }
   const ids = new Set(), numbers = new Set(), drafts = [];
   for (const draft of input.drafts) {
     if (!Number.isSafeInteger(draft.contractor_id) || draft.contractor_id < 1 || ids.has(draft.contractor_id))
@@ -717,9 +725,14 @@ export async function saveCampaignDrafts(input) {
     const outreach = await getWhatsAppOutreachState(number);
     if (c.stage === 'Do Not Contact' || outreach.suppressed || outreach.followup_paused)
       throw campaignError('A selected recipient opted out or has already replied. Remove them from this campaign.');
+    const permission = draft.permission || {};
+    if ((permission.basis && !['test','express','inferred'].includes(permission.basis)) ||
+      (permission.note !== undefined && (typeof permission.note !== 'string' || permission.note.length > 1000)))
+      throw campaignError('Invalid recipient permission record.');
     ids.add(c.id); numbers.add(number);
     drafts.push({ contractor_id: c.id, business_name: c.business_name, number,
-      message: draft.message.trim(), status: 'draft' });
+      message: draft.message.trim(), status: 'draft', sender,
+      permission: { basis: permission.basis || '', note: (permission.note || '').trim(), recorded_at: new Date().toISOString() } });
   }
   if (input.id) {
     if (!Number.isSafeInteger(input.revision)) throw campaignError('Reload the campaign before editing.', 409);
@@ -756,6 +769,7 @@ export async function startCampaign(id, revision, consentConfirmed, approvedBy =
     const lead = await getContractor(d.contractor_id);
     if (!lead || contractorWhatsAppNumber(lead) !== d.number) throw campaignError('Recipient changed or was deleted.');
     if (!allowedSendNumber(d.number)) throw campaignError('Test mode permits only your configured test numbers.');
+    try { assertCampaignContent(d, senderMode()); } catch (e) { throw campaignError(e.message); }
   }
   const started = await run("UPDATE whatsapp_campaigns SET state='starting' WHERE id=? AND revision=? AND state IN ('draft','paused')", [id, revision]);
   if (!started.changes && c.state !== 'starting') throw campaignError('Campaign changed. Reload before starting.', 409);
@@ -765,7 +779,7 @@ export async function startCampaign(id, revision, consentConfirmed, approvedBy =
     await run(`INSERT INTO whatsapp_dispatch(id,campaign_id,contractor_id,number,message)
       SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM whatsapp_campaigns WHERE id=? AND revision=? AND state='starting')
       ON CONFLICT(campaign_id,contractor_id) DO NOTHING`,
-      [`${id}:${d.contractor_id}`, id, d.contractor_id, d.number, d.message, id, revision]);
+      [`${id}:${d.contractor_id}`, id, d.contractor_id, d.number, campaignMessage(d), id, revision]);
   }
   await run("UPDATE whatsapp_campaigns SET state='running' WHERE id=? AND revision=? AND state='starting'", [id, revision]);
   return getCampaign(id);
@@ -780,11 +794,18 @@ async function dispatchEligible(job) {
   const flags = await getWhatsAppOutreachState(job.number);
   if (lead.stage === 'Do Not Contact' || flags.suppressed || flags.followup_paused) return 'Recipient opted out or replied';
   if (!allowedSendNumber(job.number)) return 'Recipient is outside test allowlist';
+  const campaign = await getCampaign(job.campaign_id);
+  const draft = campaign.drafts.find(d => d.contractor_id === job.contractor_id);
+  try {
+    if (!draft || assertCampaignContent(draft, senderMode()) !== job.message) return 'Message needs a new reviewed draft with sender and permission details';
+  } catch { return 'Message needs sender identity and recipient permission details'; }
   const previous = await one("SELECT id FROM whatsapp_dispatch WHERE number=? AND id<>? AND state IN ('sending','sent','uncertain') LIMIT 1", [job.number, job.id]);
   return previous ? 'Number already attempted in another campaign' : '';
 }
 export async function claimDispatch(now = Date.now()) {
   if (senderMode() === 'disabled') return null;
+  const health = await getSenderHealth(now);
+  if (!health.ready) return null;
   // No new work while a gateway attempt awaits its durable receipt.
   if (await one("SELECT id FROM whatsapp_dispatch WHERE state='sending' LIMIT 1")) return null;
   const token = randomUUID();
@@ -825,6 +846,7 @@ export async function authorizeDispatch(input, now = Date.now()) {
   const c = await getCampaign(job.campaign_id);
   const slot = campaignSlotAt(now, c.schedule);
   let reason = await dispatchEligible(job);
+  if (!(await getSenderHealth(now)).ready) reason = 'Sender or WhatsApp health is not ready';
   if (c.state !== 'running' || !slot) reason = 'Campaign paused or outside its window';
   if (!['available','not_found','check_failed'].includes(input.registration)) throw campaignError('Invalid registration result.');
   if (!reason) await saveWhatsAppCheck(job.contractor_id, { number: job.number, status: input.registration,
@@ -891,4 +913,28 @@ export async function finishDispatch(input, now = Date.now()) {
     AND NOT EXISTS(SELECT 1 FROM whatsapp_dispatch WHERE campaign_id=? AND state IN ('queued','checking','sending'))`, [job.campaign_id, job.campaign_id]);
   await run('UPDATE whatsapp_sender_guard SET lease_until=0 WHERE id=1 AND token=?', [job.token]);
   return { ok: true };
+}
+
+
+export async function recordSenderHeartbeat(input, now = Date.now()) {
+  if (!['connected','disconnected','unknown'].includes(input.gateway) || typeof input.pending !== 'boolean' ||
+      !['none','crm_error','worker_error'].includes(input.error || 'none')) throw campaignError('Invalid sender heartbeat.');
+  await run(`INSERT INTO whatsapp_sender_health(id,reported_at,gateway,pending,error) VALUES(1,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET reported_at=excluded.reported_at,gateway=excluded.gateway,pending=excluded.pending,error=excluded.error`,
+    [now, input.gateway, input.pending, input.error || 'none']);
+  return { ok: true };
+}
+export async function getSenderHealth(now = Date.now()) {
+  const row = await one('SELECT * FROM whatsapp_sender_health WHERE id=1');
+  const fresh = !!row && now - row.reported_at <= 180000 && row.reported_at <= now + 10000;
+  const pending = await one("SELECT MIN(attempt_at) AS oldest FROM whatsapp_dispatch WHERE state='sending'");
+  const alerts = [];
+  if (!row) alerts.push('Sender has not reported status. Install or update the VPS worker.');
+  else if (!fresh) alerts.push('Sender has not reported for more than 3 minutes. Check the VPS service or connection.');
+  if (fresh && row.gateway !== 'connected') alerts.push(row.gateway === 'disconnected' ? 'WhatsApp session is disconnected. Check the gateway.' : 'WhatsApp connection could not be verified.');
+  if (fresh && row.error !== 'none') alerts.push('The sender reported a processing error. Check its VPS logs.');
+  if (row?.pending || pending?.oldest) alerts.push('A send receipt is pending. Do not resend; the worker will retry the CRM acknowledgement.');
+  return { reported_at: row?.reported_at || null, gateway: fresh ? row.gateway : 'unknown', fresh,
+    ready: fresh && row.gateway === 'connected' && row.error === 'none' && !row.pending,
+    alerts, awaiting_receipt: !!pending?.oldest };
 }

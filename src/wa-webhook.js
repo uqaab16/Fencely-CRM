@@ -25,8 +25,9 @@ export function verifyWebhook(raw, signature) {
 }
 
 export function replyKind(text) {
-  const value = text.trim().toLowerCase();
-  if (/^(?:please\s+)?(?:stop(?:\s+(?:messaging|contacting)(?:\s+me)?)?|unsubscribe|remove me|do not contact(?: me)?|not interested|no more messages)[.!]*$/.test(value)) return 'stop';
+  const value = text.trim().toLowerCase().replace(/[’‘]/g, "'").replace(/\s+/g, ' ');
+  const request = value.replace(/[.!?]+$/, '').replace(/[,.! ]+(?:please|thanks|thank you)$/, '').replace(/^(?:please|kindly)[, ]+/, '');
+  if (/^(?:stop(?: (?:messaging|contacting|texting|sending messages to)(?: me)?)?|unsubscribe(?: me)?|remove me(?: from (?:your|the) (?:list|database|contacts))?|do not (?:contact|message|text)(?: me)?(?: again)?|don't (?:contact|message|text) me(?: again)?|not interested|no more (?:messages|texts))$/.test(request)) return 'stop';
   return /^interested[.!]*$/.test(value) ? 'interested' : 'reply';
 }
 
