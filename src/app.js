@@ -65,6 +65,9 @@ async function readBody(req) {
 // implemented directly against the async db layer.
 // ---------------------------------------------------------------------------
 const MCP_TOOLS = [
+  { name: 'prepare_whatsapp_list', description: 'Start a read-only city list builder. Checks all phone labels sequentially and keeps scanning until up to target distinct available numbers are found or the city pool is exhausted. Excludes opt-outs, replies and prior attempts; does not require permission evidence to check registration. Never sends or saves campaign drafts. Poll get_whatsapp_preparation for results.', inputSchema: { type: 'object', properties: { city: { type: 'string' }, state: { type: 'string' }, target: { type: 'integer', minimum: 1, maximum: 20 } }, required: ['city'] } },
+  { name: 'get_whatsapp_preparation', description: 'Read progress and the verified available list. Ready means the requested count was found; exhausted may contain fewer. Registration is not marketing permission. Never invent extra leads.', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+  { name: 'list_whatsapp_preparations', description: 'List city WhatsApp list-building jobs and their IDs. No sends.', inputSchema: { type: 'object', properties: {} } },
   { name: 'list_campaigns', description: 'List saved WhatsApp draft campaigns. Does not send messages.', inputSchema: { type: 'object', properties: {} } },
   { name: 'get_campaign', description: 'Read a campaign and its reviewed drafts.', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
   { name: 'save_campaign_drafts', description: 'Only after the user explicitly says to add their reviewed messages to CRM: save 1–20 drafts together. Show all drafts and the sender signature/STOP text in chat for review first. Supply the user-confirmed sender name, business and contact details and each recipient permission basis/note. Never invent identity or consent. Never sends or starts a campaign. Supply id and revision to replace existing drafts.', inputSchema: { type: 'object', properties: { id: { type: 'string' }, revision: { type: 'integer' }, name: { type: 'string' }, sender: { type: 'object', properties: { name: { type: 'string' }, business: { type: 'string' }, contact: { type: 'string' } } }, schedule: { type: 'object', properties: { timeZone: { type: 'string' }, startHour: { type: 'integer' }, startDate: { type: 'string', description: 'Earliest sending date, YYYY-MM-DD in the recipient time zone' }, dailyLimit: { type: 'integer' } }, required: ['timeZone'] }, drafts: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: { contractor_id: { type: 'integer' }, message: { type: 'string' }, permission: { type: 'object', properties: { basis: { type: 'string', enum: ['test', 'express', 'inferred'] }, note: { type: 'string' } } } }, required: ['contractor_id', 'message'] } } }, required: ['name', 'schedule', 'drafts'] } },
@@ -81,6 +84,11 @@ const MCP_TOOLS = [
 
 async function callMcpTool(name, args = {}) {
   switch (name) {
+    case 'prepare_whatsapp_list':
+      if (!bridgeConfigured()) throw new Error('Private registration worker is not configured.');
+      return db.createWhatsAppPreparation(args);
+    case 'get_whatsapp_preparation': return db.getWhatsAppPreparation(args.id);
+    case 'list_whatsapp_preparations': return db.listWhatsAppPreparations();
     case 'list_campaigns': return db.listCampaigns();
     case 'get_campaign': return db.getCampaign(args.id);
     case 'save_campaign_drafts': return db.saveCampaignDrafts(args);
@@ -278,12 +286,12 @@ export default async function handler(req, res) {
     if (p.startsWith('/api/whatsapp/bridge/')) {
       if (!bridgeAuthorized(req)) return send(res, 401, { error: 'Unauthorized' });
       if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
-      if (p === '/api/whatsapp/bridge/claim') return send(res, 200, { job: await db.claimWhatsAppCheck() });
+      if (p === '/api/whatsapp/bridge/claim') return send(res, 200, { job: (await db.claimWhatsAppCheck()) || await db.claimWhatsAppPreparation() });
       if (p === '/api/whatsapp/bridge/result') {
         const b = await readBody(req);
         if (typeof b.id !== 'string' || typeof b.token !== 'string' || typeof b.number !== 'string')
           return send(res, 400, { error: 'Invalid check result' });
-        return send(res, 200, await db.finishWhatsAppCheck(b.id, b.token, bridgeResult(b.number, b)));
+        return send(res, 200, await (b.id.startsWith('prep:') ? db.finishWhatsAppPreparation : db.finishWhatsAppCheck)(b.id, b.token, bridgeResult(b.number, b)));
       }
       return send(res, 404, { error: 'Not found' });
     }
@@ -293,6 +301,13 @@ export default async function handler(req, res) {
       const user = auth.authUser(req);
       if (!user) return send(res, 401, { error: 'Unauthorized' });
 
+      if (p === '/api/whatsapp/preparations' && req.method === 'GET') return send(res, 200, await db.listWhatsAppPreparations());
+      if (p === '/api/whatsapp/preparations' && req.method === 'POST') {
+        if (!bridgeConfigured()) return send(res, 503, { error: 'Private registration worker is not configured.' });
+        return send(res, 200, await db.createWhatsAppPreparation(await readBody(req)));
+      }
+      const preparationMatch = p.match(/^\/api\/whatsapp\/preparations\/([a-f0-9-]+)$/);
+      if (preparationMatch && req.method === 'GET') return send(res, 200, await db.getWhatsAppPreparation(preparationMatch[1]));
       if (p === '/api/campaigns/config' && req.method === 'GET') return send(res, 200, { mode: db.senderMode(), health: await db.getSenderHealth() });
       const campaignAction = p.match(/^\/api\/campaigns\/([a-f0-9-]+)\/(start|pause)$/);
       if (campaignAction && req.method === 'POST') {

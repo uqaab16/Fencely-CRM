@@ -20,7 +20,7 @@ export function normaliseWhatsAppNumber(value) {
 }
 
 export function contractorWhatsAppNumber(c) {
-  return normaliseWhatsAppNumber(c.whatsapp_number || c.mobile || c.landline);
+  return [c.whatsapp_number, c.mobile, c.landline].map(normaliseWhatsAppNumber).find(Boolean) || null;
 }
 
 export function gatewayConfigured() {

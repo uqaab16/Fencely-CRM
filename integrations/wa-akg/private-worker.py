@@ -52,6 +52,7 @@ def run():
     headers = {"Authorization": "Bearer " + secret}
     pending = None
     while True:
+        delay = 60
         try:
             if pending is None:
                 job = post(origin + "/api/whatsapp/bridge/claim", {}, headers).get("job")
@@ -62,6 +63,7 @@ def run():
                 post(origin + "/api/whatsapp/bridge/result", pending, headers)
                 pending = None
                 print("Registration check saved", flush=True)
+                delay = 5
         except urllib.error.HTTPError as error:
             # Reject old leases without ever logging numbers, keys or bodies.
             if error.code == 409:
@@ -69,7 +71,7 @@ def run():
             print("CRM HTTP error:", error.code, flush=True)
         except Exception:
             print("Connection unavailable; retrying", flush=True)
-        time.sleep(60)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":

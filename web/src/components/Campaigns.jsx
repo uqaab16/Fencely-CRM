@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
+import WhatsAppPreparation from './WhatsAppPreparation';
 import { campaignMessage } from '../../../src/campaign-content.js';
 const ZONES = ['Australia/Perth', 'Australia/Melbourne', 'Australia/Sydney', 'Australia/Brisbane', 'Australia/Adelaide', 'Australia/Darwin', 'Australia/Hobart'];
 export default function Campaigns({ toast }) {
@@ -35,6 +36,7 @@ export default function Campaigns({ toast }) {
   const editable = campaign?.state === 'draft';
   return <section className="card" style={{ padding: 24 }}>
     <h2>WhatsApp campaigns</h2>
+    <WhatsAppPreparation toast={toast} />
     <p>Review messages with Claude, then ask Claude to add the approved batch to CRM. Review the batch here before starting.</p>
     <p>{mode === 'disabled' ? 'Sender setup is not enabled yet.' : mode === 'test' ? 'Test mode: only your configured test numbers can receive messages.' : 'Sending enabled. The VPS sender must be running.'}</p>
     <div role="status" aria-live="polite" style={{ border: '1px solid #d5ded8', padding: 12, margin: '12px 0' }}>
