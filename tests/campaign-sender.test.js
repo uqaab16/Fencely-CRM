@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'campaign-sender-'));
 process.env.CRM_DB_PATH = path.join(temp, 'db.sqlite');
 for (const key of ['TURSO_DATABASE_URL','TURSO_AUTH_TOKEN','TURSO_HTTP_URL']) delete process.env[key];
@@ -15,9 +17,13 @@ async function batch(count = 1, schedule = {}) {
   const drafts = [];
   for (let i = 0; i < count; i++) {
     const lead = await db.createContractor({ business_name: `Test ${++serial}`, mobile: '+614' + String(serial).padStart(8, '0') });
-    drafts.push({ contractor_id: lead.id, message: `Reviewed ${serial}` });
+    drafts.push({ contractor_id: lead.id, message: `Reviewed ${serial}`, permission: { basis: 'express', note: 'Offline fixture: permission recorded by phone on 2026-10-20' } });
   }
-  return db.saveCampaignDrafts({ name: `Batch ${serial}`, schedule: { timeZone: 'Australia/Perth', ...schedule }, drafts });
+  return db.saveCampaignDrafts({ sender: { name: 'Test Sender', business: 'Test Business', contact: 'test@example.test' }, name: `Batch ${serial}`, schedule: { timeZone: 'Australia/Perth', ...schedule }, drafts });
+}
+async function claim(now) {
+  await db.recordSenderHeartbeat({ gateway: 'connected', pending: false }, now);
+  return db.claimDispatch(now);
 }
 async function start(c) { return db.startCampaign(c.id, c.revision, true); }
 async function permit(job, now) { return db.authorizeDispatch({ ...job, registration: 'available' }, now); }
@@ -28,7 +34,7 @@ test.after(() => fs.rmSync(temp, { recursive: true, force: true }));
 
 test('sender is disabled by default; worker secrets remain separate', async () => {
   delete process.env.WA_SEND_MODE; delete process.env.WA_SENDER_SECRET;
-  assert.equal(await db.claimDispatch(T), null);
+  assert.equal(await claim(T), null);
   assert.equal(senderAuthorized({ headers: {} }), false);
   process.env.WA_SENDER_SECRET = 's'.repeat(40); process.env.WA_BRIDGE_SECRET = 'b'.repeat(40);
   assert.equal(senderAuthorized({ headers: { authorization: 'Bearer ' + process.env.WA_BRIDGE_SECRET } }), false);
@@ -42,17 +48,17 @@ test('sender is disabled by default; worker secrets remain separate', async () =
 
 test('atomic claims, pause before permit, and exact once receipts preserve replies', async () => {
   const c = await start(await batch(2));
-  const claims = await Promise.all([db.claimDispatch(T), db.claimDispatch(T)]);
+  const claims = await Promise.all([claim(T), claim(T)]);
   assert.equal(claims.filter(Boolean).length, 1);
   const job = claims.find(Boolean);
   await db.pauseCampaign(c.id);
   assert.equal((await permit(job, T)).send, false);
   await start(await db.getCampaign(c.id));
-  const next = await db.claimDispatch(T);
+  const next = await claim(T);
   const p = await permit(next, T);
   assert.equal(p.send, true); assert.equal(p.expires_at, T + 10000);
   await assert.rejects(() => permit(next, T), /consumed/);
-  assert.equal(await db.claimDispatch(T + GAP), null); // awaiting receipt blocks globally
+  assert.equal(await claim(T + GAP), null); // awaiting receipt blocks globally
   await db.recordWhatsAppReply({ session_id: 'test', message_id: 'reply', number: next.number, text: 'Hello', kind: 'reply', received_at: new Date(T).toISOString() });
   await receipt(next, T);
   await receipt(next, T);
@@ -60,27 +66,27 @@ test('atomic claims, pause before permit, and exact once receipts preserve repli
   const lead = await db.getContractor(campaign.deliveries.find(d => d.state === 'sent').contractor_id);
   assert.equal(lead.stage, 'Replied');
   assert.equal(lead.activities.filter(a => a.type === 'whatsapp-sent').length, 1);
-  assert.equal(await db.claimDispatch(T + GAP - 1), null);
+  assert.equal(await claim(T + GAP - 1), null);
 });
 
 test('phone edits, STOP during check and failed registration do not authorize sends', async () => {
   const c = await start(await batch(3));
-  let job = await db.claimDispatch(T + GAP);
+  let job = await claim(T + GAP);
   const d = (await db.getCampaign(c.id)).deliveries.find(d => d.id === job.id);
   await db.updateContractor(d.contractor_id, { mobile: '+61499999999' });
   assert.equal((await permit(job, T + GAP)).send, false);
-  job = await db.claimDispatch(T + GAP);
+  job = await claim(T + GAP);
   await db.recordWhatsAppReply({ session_id: 'test', message_id: 'stop', number: job.number, text: 'Stop', kind: 'stop', received_at: new Date(T).toISOString() });
   assert.equal((await permit(job, T + GAP)).send, false);
-  job = await db.claimDispatch(T + GAP);
+  job = await claim(T + GAP);
   assert.equal((await db.authorizeDispatch({ ...job, registration: 'check_failed' }, T + GAP)).send, false);
   assert.equal((await db.getCampaign(c.id)).deliveries.filter(d => d.state === 'sent').length, 0);
 });
 
 test('checking leases can recover; uncertain sends never requeue and pause the campaign', async () => {
   const c = await start(await batch(2));
-  const job = await db.claimDispatch(T + GAP);
-  const replacement = await db.claimDispatch(T + GAP + 121000);
+  const job = await claim(T + GAP);
+  const replacement = await claim(T + GAP + 121000);
   assert.equal(replacement.id, job.id); assert.notEqual(replacement.token, job.token);
   await assert.rejects(() => permit(job, T + GAP + 121000), /expired/);
   await permit(replacement, T + GAP + 121000);
@@ -88,7 +94,7 @@ test('checking leases can recover; uncertain sends never requeue and pause the c
   assert.equal((await db.getCampaign(c.id)).state, 'paused');
   await receipt(replacement, T + GAP + 121000, 'uncertain');
   await start(await db.getCampaign(c.id));
-  const next = await db.claimDispatch(T + GAP * 2 + 121000);
+  const next = await claim(T + GAP * 2 + 121000);
   assert.notEqual(next.id, replacement.id);
   await db.authorizeDispatch({ ...next, registration: 'not_found' }, T + GAP * 2 + 121000);
 });
@@ -100,11 +106,11 @@ test('global rolling cap is shared across batches and weekends never claim', asy
   let attempts = 0;
   for (let i = 0; i < 20; i++) {
     const now = first + GAP * i;
-    const job = await db.claimDispatch(now);
+    const job = await claim(now);
     if (job) { await permit(job, now); await receipt(job, now); attempts++; }
   }
   assert.equal(attempts, 18);
-  assert.equal(await db.claimDispatch(Date.parse('2026-10-24T00:00:00Z')), null);
+  assert.equal(await claim(Date.parse('2026-10-24T00:00:00Z')), null);
   await db.pauseCampaign(c.id);
 });
 
@@ -113,7 +119,7 @@ test('HTTP dispatch endpoints reject login, MCP and registration bridge credenti
   const server = http.createServer(handler); await new Promise(r => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    for (const path of ['/api/whatsapp/sender/claim','/api/whatsapp/sender/authorize','/api/whatsapp/sender/result']) {
+    for (const path of ['/api/whatsapp/sender/claim','/api/whatsapp/sender/authorize','/api/whatsapp/sender/result','/api/whatsapp/sender/heartbeat']) {
       const r = await fetch(base + path, { method: 'POST', headers: { authorization: 'Bearer ' + process.env.WA_BRIDGE_SECRET }, body: '{}' });
       assert.equal(r.status, 401);
     }
@@ -142,4 +148,45 @@ test('HTTP draft review and Start require login; MCP can save drafts but cannot 
     assert.equal((await call(`/api/campaigns/${c.id}/start`, login, { revision: c.revision, consent_confirmed: true })).status, 200);
     assert.equal((await call(`/api/campaigns/${c.id}/pause`, login, {})).status, 200);
   } finally { await new Promise(r => server.close(r)); }
+});
+
+test('missing identity/permission prevents Start without creating deliveries', async () => {
+  const lead = await db.createContractor({ business_name: 'Incomplete', mobile: '+61498765432' });
+  const draft = await db.saveCampaignDrafts({ name: 'Incomplete draft', schedule: { timeZone: 'Australia/Perth' }, drafts: [{ contractor_id: lead.id, message: 'Hello' }] });
+  await assert.rejects(start(draft), /sender name/);
+  assert.equal((await db.getCampaign(draft.id)).deliveries.length, 0);
+});
+
+test('sender reports are explicit and stale/disconnected status cannot claim work', async () => {
+  await assert.rejects(() => db.recordSenderHeartbeat({ gateway: 'banned', pending: false }, T), /Invalid/);
+  await db.recordSenderHeartbeat({ gateway: 'connected', pending: false }, T);
+  assert.equal((await db.getSenderHealth(T + 180001)).ready, false);
+  assert.equal(await db.claimDispatch(T + 180001), null);
+  await db.recordSenderHeartbeat({ gateway: 'disconnected', pending: false }, T);
+  const health = await db.getSenderHealth(T);
+  assert.equal(health.ready, false); assert.match(health.alerts.join(' '), /disconnected/);
+  assert.equal(await db.claimDispatch(T), null);
+});
+
+
+test('completed batch cannot replay after restart and the next weekday resumes spaced work', async () => {
+  const c = await start(await batch(2));
+  const monday = Date.parse('2026-10-26T11:59:00Z');
+  const first = await claim(monday);
+  const granted = await permit(first, monday);
+  assert.match(granted.message, /Test Sender · Test Business · test@example.test/);
+  assert.match(granted.message, /Reply STOP to opt out\.$/);
+  await receipt(first, monday);
+  assert.equal(await claim(monday + 60000), null); // window ended
+  const tuesday = Date.parse('2026-10-27T00:00:00Z');
+  const second = await claim(tuesday);
+  assert.notEqual(first.id, second.id);
+  await permit(second, tuesday); await receipt(second, tuesday);
+  assert.equal((await db.getCampaign(c.id)).state, 'complete');
+  assert.equal(await claim(tuesday + GAP), null);
+  const script = `const db = await import(${JSON.stringify(pathToFileURL(path.resolve('src/db.js')).href)});
+    await db.recordSenderHeartbeat({gateway:'connected',pending:false}, ${tuesday + GAP});
+    console.log(JSON.stringify({state:(await db.getCampaign(${JSON.stringify(c.id)})).state,job:await db.claimDispatch(${tuesday + GAP})}));`;
+  const restarted = JSON.parse(execFileSync(process.execPath, ['--input-type=module','-e', script], { env: process.env, encoding: 'utf8' }));
+  assert.equal(restarted.state, 'complete'); assert.equal(restarted.job, null);
 });

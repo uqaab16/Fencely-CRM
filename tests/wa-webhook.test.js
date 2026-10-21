@@ -121,3 +121,10 @@ test('HTTP webhook rejects unsigned/tampered requests; signed reply logs no outb
     await new Promise(resolve => app.close(resolve));
   }
 });
+
+test('clear natural-language opt-outs are permanent; ambiguous conversation stays a reply', () => {
+  for (const text of ['Stop texting me', 'Please stop texting me!', 'Stop contacting me, thanks.', 'Do not message me again.', "Don't text me again", 'Please remove me from your list', 'Unsubscribe me please', 'No more texts'])
+    assert.equal(replyKind(text), 'stop', text);
+  for (const text of ["Don't stop messaging me", 'Can you stop by tomorrow?', 'Please stop by our workshop', 'How do I unsubscribe?', 'Not interested in timber, show me steel'])
+    assert.equal(replyKind(text), 'reply', text);
+});

@@ -19,10 +19,11 @@ server.tool('list_campaigns', 'List saved WhatsApp draft campaigns. Never sends.
   async () => txt(await db.listCampaigns()));
 server.tool('get_campaign', 'Read a campaign and its drafts.', { id: z.string() },
   async ({ id }) => txt(await db.getCampaign(id)));
-server.tool('save_campaign_drafts', 'Only when the user explicitly asks to add reviewed drafts to CRM. Show all messages in chat first. Save only, never starts sending.', {
+server.tool('save_campaign_drafts', 'Only when the user explicitly asks to add reviewed drafts to CRM. Show all messages, sender signature and STOP text in chat first. Include the user-confirmed sender and recipient permission records; never invent them. Save only, never starts sending.', {
   id: z.string().optional(), revision: z.number().int().optional(), name: z.string(),
+  sender: z.object({ name: z.string(), business: z.string(), contact: z.string() }).optional(),
   schedule: z.object({ timeZone: z.string(), startHour: z.number().int().optional(), dailyLimit: z.number().int().optional() }),
-  drafts: z.array(z.object({ contractor_id: z.number().int().positive(), message: z.string() })).min(1).max(20),
+  drafts: z.array(z.object({ contractor_id: z.number().int().positive(), message: z.string(), permission: z.object({ basis: z.enum(['test','express','inferred']), note: z.string() }).optional() })).min(1).max(20),
 }, async (input) => txt(await db.saveCampaignDrafts(input)));
 
 server.tool('check_whatsapp', 'Check one contractor number via your configured WA-AKG gateway and save the result. Does not send a message or record marketing consent.', { id: z.number().int().positive() },

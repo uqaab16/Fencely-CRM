@@ -40,3 +40,19 @@ To stop dispatches, Pause campaigns and stop `fencely-sender`; then set WA_SEND_
 ## Verification
 
 `npm test`, `python3 tests/campaign-worker-test.py`, and `cd web && npm run build`.
+
+## Sender identity, opt-outs and monitoring update
+
+Each draft batch now has a user-supplied sender name, business name and contact email/phone/HTTPS URL. The server appends these details and `Reply STOP to opt out.` inside the message body. The CRM previews the exact rendered message before Start. Keep the draft body separate from this signature to avoid repeating it. No personal sender name or contact is inferred. Start and pre-send authorization enforce identity, final length and a recipient permission record. The contact format is validated; ownership and accuracy are user assertions, not verified by the app.
+
+Each draft records `permission: {basis: 'test'|'express'|'inferred', note: 'supporting evidence/source and date'}`. A server-generated recorded_at accompanies the saved record. The campaign revision approved by the logged-in user binds this record and the sender identity to that batch. A test basis is blocked in live mode. Neither a public number nor a successful registration check proves permission. Existing completed campaigns remain historical; old unstarted drafts need sender/permission fields filled in. Legacy queued messages without the required reviewed signature are skipped, not silently rewritten or sent.
+
+The worker now reports `/api/whatsapp/sender/heartbeat` with a narrow enum for session health, receipt-journal presence and processing errors. It checks only the configured session through the loopback gateway. No phone number, key, URL, free-form upstream error or message content is in this heartbeat. The server timestamps reports. Campaigns displays the last report, session status and inline warnings; it polls every 30 seconds while the page is open. A report older than three minutes is stale. Missing/stale/disconnected/error reports prevent new claims and permits. Pending receipt reconciliation is still allowed with WhatsApp disconnected. A disconnect is not proof of a ban. These are in-CRM alerts; no external notifications are configured.
+
+Deployment must update the VPS `campaign-worker.py` as well as the CRM. The old worker does not report heartbeats and cannot start new sends under the new server checks. Keep test mode. Download the reviewed worker to a temporary filename, verify SHA-256, stop only fencely-sender, replace the file and restart that service. Keep the existing secrets, worker.env, receipt journal and systemd unit. Do not modify OpenClaw, Traefik or the registration worker.
+
+Clear requests such as 'Stop texting me', 'Do not message me again', 'Unsubscribe me' and 'Remove me from your list' now create permanent opt-outs. Negated/ambiguous sentences such as 'Do not stop messaging me' or 'Stop by tomorrow' remain ordinary replies, which still pause automated outreach. This is deterministic phrase recognition, not a general language interpreter; review ambiguous replies manually.
+
+The tracked dummy SQLite database/WAL/SHM files are removed from the current repository tree, while local copies remain on disk and ignored. Git history is not rewritten. Production Turso data is untouched.
+
+Automated checks additionally simulate next-weekday continuation and reopen the SQLite database in a separate Node process to verify completion/no replay after restart. This is not a real Hostinger reboot or a days-long WhatsApp pilot. Real multi-recipient spacing, the new gateway-health report and VPS restart behaviour still need controlled operational validation using eligible personal test numbers. Preserve all existing opt-outs.

@@ -56,5 +56,16 @@ class WorkerTests(unittest.TestCase):
                 send.assert_not_called()
                 self.assertTrue(network.call_args.args[0].endswith('/sender/result'))
 
+class GatewayHealthTests(unittest.TestCase):
+    def test_target_session_only_and_unknown_is_not_a_ban_claim(self):
+        def connected(url, headers):
+            return {'status': True, 'data': [{'sessionId': 'other', 'status': 'DISCONNECTED'}, {'sessionId': 'target', 'status': 'CONNECTED'}]}
+        self.assertEqual(sender.gateway_status('key', 'target', connected), 'connected')
+        self.assertEqual(sender.gateway_status('key', 'missing', connected), 'unknown')
+        self.assertEqual(sender.gateway_status('key', 'target', lambda *a: {'status': True, 'data': [{'sessionId': 'target', 'status': 'DISCONNECTED'}]}), 'disconnected')
+        def failed(*args):
+            raise TimeoutError()
+        self.assertEqual(sender.gateway_status('key', 'target', failed), 'unknown')
+
 if __name__ == '__main__':
     unittest.main()
