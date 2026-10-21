@@ -23,6 +23,7 @@ import { gatewayConfigured, VERIFICATION_LABELS } from './whatsapp.js';
 
 import { requestWhatsAppCheck, bridgeConfigured } from './wa-service.js';
 import { bridgeAuthorized, bridgeResult } from './wa-bridge.js';
+import { senderAuthorized } from './wa-sender-auth.js';
 import { readWebhookBody, verifyWebhook, parseWebhook } from './wa-webhook.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -261,6 +262,17 @@ export default async function handler(req, res) {
       return send(res, 200, await db.recordWhatsAppReply(event));
     }
 
+    if (p.startsWith('/api/whatsapp/sender/')) {
+      if (!senderAuthorized(req)) return send(res, 401, { error: 'Unauthorized' });
+      if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
+      if (p === '/api/whatsapp/sender/claim') return send(res, 200, { job: await db.claimDispatch() });
+      const b = await readBody(req);
+      if (typeof b.id !== 'string' || typeof b.token !== 'string') return send(res, 400, { error: 'Invalid dispatch receipt' });
+      if (p === '/api/whatsapp/sender/authorize') return send(res, 200, await db.authorizeDispatch(b));
+      if (p === '/api/whatsapp/sender/result') return send(res, 200, await db.finishDispatch(b));
+      return send(res, 404, { error: 'Not found' });
+    }
+
     // Dedicated, limited worker credential; never accepts a login/MCP token.
     if (p.startsWith('/api/whatsapp/bridge/')) {
       if (!bridgeAuthorized(req)) return send(res, 401, { error: 'Unauthorized' });
@@ -280,6 +292,14 @@ export default async function handler(req, res) {
       const user = auth.authUser(req);
       if (!user) return send(res, 401, { error: 'Unauthorized' });
 
+      if (p === '/api/campaigns/config' && req.method === 'GET') return send(res, 200, { mode: db.senderMode() });
+      const campaignAction = p.match(/^\/api\/campaigns\/([a-f0-9-]+)\/(start|pause)$/);
+      if (campaignAction && req.method === 'POST') {
+        const b = await readBody(req);
+        return send(res, 200, campaignAction[2] === 'start'
+          ? await db.startCampaign(campaignAction[1], b.revision, b.consent_confirmed, user.email)
+          : await db.pauseCampaign(campaignAction[1]));
+      }
       if (p === '/api/campaigns' && req.method === 'GET') return send(res, 200, await db.listCampaigns());
       if (p === '/api/campaigns' && req.method === 'POST') return send(res, 200, await db.saveCampaignDrafts(await readBody(req)));
       const campaignMatch = p.match(/^\/api\/campaigns\/([a-f0-9-]+)$/);

@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTursoClient } from './turso.js';
-import { validateCampaignSchedule } from './campaign-schedule.js';
+import { campaignSlotAt, validateCampaignSchedule } from './campaign-schedule.js';
 import { STAGES, NICHES, FIT_NICHES } from './config.js';
 import { contractorWhatsAppNumber, VERIFICATION_LABELS } from './whatsapp.js';
 
@@ -69,6 +69,22 @@ async function createLocalBackend() {
 }
 
 const SCHEMA = [
+`CREATE TABLE IF NOT EXISTS whatsapp_campaign_approvals (
+ id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, revision INTEGER NOT NULL,
+ approved_by TEXT NOT NULL, approved_at TEXT NOT NULL
+)`,
+`CREATE TABLE IF NOT EXISTS whatsapp_dispatch (
+ id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, contractor_id INTEGER NOT NULL,
+ number TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued',
+ token TEXT DEFAULT '', lease_until INTEGER DEFAULT 0, attempt_at INTEGER DEFAULT 0,
+ slot_key TEXT DEFAULT '', message_id TEXT DEFAULT '', detail TEXT DEFAULT '',
+ confirmed_at TEXT DEFAULT '', UNIQUE(campaign_id,contractor_id)
+)`,
+`CREATE TABLE IF NOT EXISTS whatsapp_sender_guard (
+ id INTEGER PRIMARY KEY CHECK(id=1), token TEXT DEFAULT '', lease_until INTEGER DEFAULT 0,
+ last_attempt INTEGER DEFAULT 0
+)`,
+`INSERT INTO whatsapp_sender_guard(id) VALUES(1) ON CONFLICT DO NOTHING`,
 `CREATE TABLE IF NOT EXISTS whatsapp_campaigns (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule TEXT NOT NULL,
   drafts TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
@@ -443,17 +459,21 @@ export async function bulkSetStage(ids, stage) {
 
 export async function getContractor(id) {
   const b = await ready();
-  const [cRes, aRes, tRes, inboxRes] = await b.batch([
+  const [cRes, aRes, tRes, inboxRes, dispatchRes] = await b.batch([
     { sql: `${CONTRACTOR_SELECT} WHERE c.id=?`, args: [Number(id)] },
     { sql: 'SELECT * FROM activities WHERE contractor_id=? ORDER BY id DESC', args: [Number(id)] },
     { sql: 'SELECT * FROM tasks WHERE contractor_id=? ORDER BY done, due_date', args: [Number(id)] },
     { sql: `SELECT i.* FROM whatsapp_inbox i JOIN whatsapp_inbox_targets t
       ON i.session_id=t.session_id AND i.message_id=t.message_id WHERE t.contractor_id=? ORDER BY i.received_at DESC`, args: [Number(id)] },
+    { sql: "SELECT * FROM whatsapp_dispatch WHERE contractor_id=? AND state='sent' ORDER BY confirmed_at DESC", args: [Number(id)] },
   ]);
   const r = cRes.rows[0];
   if (!r) return null;
   const out = row(r);
-  out.activities = [...aRes.rows, ...inboxRes.rows.map(i => ({
+  out.activities = [...aRes.rows, ...dispatchRes.rows.map(d => ({
+    id: `dispatch:${d.id}`, contractor_id: Number(id), type: 'whatsapp-sent',
+    body: d.message, created_at: d.confirmed_at,
+  })), ...inboxRes.rows.map(i => ({
     id: `wa:${i.session_id}:${i.message_id}`, contractor_id: Number(id),
     type: i.kind === 'stop' ? 'whatsapp-opt-out' : i.kind === 'interested' ? 'whatsapp-interested' : 'whatsapp-reply',
     body: i.text || '[Non-text WhatsApp reply]', created_at: i.received_at,
@@ -670,7 +690,8 @@ function campaignError(message, statusCode = 400) {
 export async function getCampaign(id) {
   const row = await one('SELECT * FROM whatsapp_campaigns WHERE id=?', [String(id)]);
   if (!row) throw campaignError('Campaign not found.', 404);
-  return { ...row, schedule: JSON.parse(row.schedule), drafts: JSON.parse(row.drafts) };
+  return { ...row, schedule: JSON.parse(row.schedule), drafts: JSON.parse(row.drafts),
+    deliveries: await many('SELECT id,contractor_id,state,detail,message_id,confirmed_at FROM whatsapp_dispatch WHERE campaign_id=? ORDER BY id', [String(id)]) };
 }
 export async function listCampaigns() {
   return (await many('SELECT id,name,state,revision,created_at FROM whatsapp_campaigns ORDER BY created_at DESC'));
@@ -712,4 +733,162 @@ export async function saveCampaignDrafts(input) {
   await run('INSERT INTO whatsapp_campaigns(id,name,schedule,drafts,created_at) VALUES(?,?,?,?,?)',
     [id, name, JSON.stringify(schedule), JSON.stringify(drafts), new Date().toISOString()]);
   return getCampaign(id);
+}
+
+
+// Dispatch capabilities are separate from the read-only registration bridge.
+export function senderMode() {
+  return ['test', 'live'].includes(process.env.WA_SEND_MODE) &&
+    (process.env.WA_SENDER_SECRET || '').length >= 32 ? process.env.WA_SEND_MODE : 'disabled';
+}
+function allowedSendNumber(number) {
+  return senderMode() === 'live' || (senderMode() === 'test' &&
+    (process.env.WA_SENDER_TEST_NUMBERS || '').split(',').map(n => n.trim().replace(/^\+/, '')).includes(number));
+}
+export async function startCampaign(id, revision, consentConfirmed, approvedBy = 'CRM user') {
+  if (senderMode() === 'disabled') throw campaignError('Sender setup is not enabled yet.', 503);
+  if (consentConfirmed !== true) throw campaignError('Confirm recipient permission before starting.');
+  const c = await getCampaign(id);
+  if (c.revision !== revision) throw campaignError('Campaign changed. Reload before starting.', 409);
+  if (!['draft', 'paused', 'starting'].includes(c.state)) throw campaignError('Campaign is already running or complete.', 409);
+  // Revalidate recipients and immutable snapshots. A new batch is needed after a phone change.
+  for (const d of c.drafts) {
+    const lead = await getContractor(d.contractor_id);
+    if (!lead || contractorWhatsAppNumber(lead) !== d.number) throw campaignError('Recipient changed or was deleted.');
+    if (!allowedSendNumber(d.number)) throw campaignError('Test mode permits only your configured test numbers.');
+  }
+  const started = await run("UPDATE whatsapp_campaigns SET state='starting' WHERE id=? AND revision=? AND state IN ('draft','paused')", [id, revision]);
+  if (!started.changes && c.state !== 'starting') throw campaignError('Campaign changed. Reload before starting.', 409);
+  await run('INSERT INTO whatsapp_campaign_approvals(id,campaign_id,revision,approved_by,approved_at) VALUES(?,?,?,?,?)',
+    [randomUUID(), id, revision, approvedBy, new Date().toISOString()]);
+  for (const d of c.drafts) {
+    await run(`INSERT INTO whatsapp_dispatch(id,campaign_id,contractor_id,number,message)
+      SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM whatsapp_campaigns WHERE id=? AND revision=? AND state='starting')
+      ON CONFLICT(campaign_id,contractor_id) DO NOTHING`,
+      [`${id}:${d.contractor_id}`, id, d.contractor_id, d.number, d.message, id, revision]);
+  }
+  await run("UPDATE whatsapp_campaigns SET state='running' WHERE id=? AND revision=? AND state='starting'", [id, revision]);
+  return getCampaign(id);
+}
+export async function pauseCampaign(id) {
+  await run("UPDATE whatsapp_campaigns SET state='paused' WHERE id=? AND state IN ('starting','running')", [id]);
+  return getCampaign(id);
+}
+async function dispatchEligible(job) {
+  const lead = await getContractor(job.contractor_id);
+  if (!lead || contractorWhatsAppNumber(lead) !== job.number) return 'Recipient changed or deleted';
+  const flags = await getWhatsAppOutreachState(job.number);
+  if (lead.stage === 'Do Not Contact' || flags.suppressed || flags.followup_paused) return 'Recipient opted out or replied';
+  if (!allowedSendNumber(job.number)) return 'Recipient is outside test allowlist';
+  const previous = await one("SELECT id FROM whatsapp_dispatch WHERE number=? AND id<>? AND state IN ('sending','sent','uncertain') LIMIT 1", [job.number, job.id]);
+  return previous ? 'Number already attempted in another campaign' : '';
+}
+export async function claimDispatch(now = Date.now()) {
+  if (senderMode() === 'disabled') return null;
+  // No new work while a gateway attempt awaits its durable receipt.
+  if (await one("SELECT id FROM whatsapp_dispatch WHERE state='sending' LIMIT 1")) return null;
+  const token = randomUUID();
+  const lock = await run(`UPDATE whatsapp_sender_guard SET token=?,lease_until=?
+    WHERE id=1 AND lease_until<=? AND last_attempt<=?`, [token, now + 120000, now, now - 2160000]);
+  if (!lock.changes) return null;
+  // Only checking leases can expire. A send with an unknown outcome is NEVER requeued.
+  await run("UPDATE whatsapp_dispatch SET state='queued',token='',lease_until=0 WHERE state='checking' AND lease_until<=?", [now]);
+  const campaigns = await many("SELECT * FROM whatsapp_campaigns WHERE state='running' ORDER BY created_at,id");
+  for (const c of campaigns) {
+    const slot = campaignSlotAt(now, JSON.parse(c.schedule));
+    if (!slot) continue;
+    const used = await one('SELECT COUNT(*) AS n FROM whatsapp_dispatch WHERE campaign_id=? AND slot_key=? AND attempt_at>0', [c.id, slot.key]);
+    if (used.n) continue;
+    const jobs = await many("SELECT * FROM whatsapp_dispatch WHERE campaign_id=? AND state='queued' ORDER BY id", [c.id]);
+    for (const job of jobs) {
+      const reason = await dispatchEligible(job);
+      if (reason) {
+        await run("UPDATE whatsapp_dispatch SET state='skipped',detail=? WHERE id=? AND state='queued'", [reason, job.id]);
+        continue;
+      }
+      const claimed = await run(`UPDATE whatsapp_dispatch SET state='checking',token=?,lease_until=?
+        WHERE id=? AND state='queued' AND EXISTS(SELECT 1 FROM whatsapp_campaigns WHERE id=? AND state='running')
+        AND EXISTS(SELECT 1 FROM whatsapp_sender_guard WHERE id=1 AND token=? AND lease_until>?)`,
+        [token, now + 120000, job.id, c.id, token, now]);
+      if (claimed.changes) return { id: job.id, token, number: job.number };
+    }
+    await run(`UPDATE whatsapp_campaigns SET state='complete' WHERE id=? AND state='running'
+      AND NOT EXISTS(SELECT 1 FROM whatsapp_dispatch WHERE campaign_id=? AND state IN ('queued','checking','sending'))`, [c.id, c.id]);
+  }
+  await run('UPDATE whatsapp_sender_guard SET lease_until=0 WHERE id=1 AND token=?', [token]);
+  return null;
+}
+export async function authorizeDispatch(input, now = Date.now()) {
+  const job = await one("SELECT * FROM whatsapp_dispatch WHERE id=? AND token=? AND state='checking' AND lease_until>?", [input.id, input.token, now]);
+  if (!job) throw campaignError('Dispatch lease expired or already consumed.', 409);
+  const snapshot = await getContractor(job.contractor_id);
+  const c = await getCampaign(job.campaign_id);
+  const slot = campaignSlotAt(now, c.schedule);
+  let reason = await dispatchEligible(job);
+  if (c.state !== 'running' || !slot) reason = 'Campaign paused or outside its window';
+  if (!['available','not_found','check_failed'].includes(input.registration)) throw campaignError('Invalid registration result.');
+  if (!reason) await saveWhatsAppCheck(job.contractor_id, { number: job.number, status: input.registration,
+    checked_at: new Date(now).toISOString(), detail: input.registration === 'available' ? 'Registration found immediately before scheduled send.' : 'Pre-send check did not confirm registration. No message sent.', jid: '' });
+  if (input.registration !== 'available') reason = 'Registration not confirmed; no message sent';
+  if (reason) {
+    await run("UPDATE whatsapp_dispatch SET state='skipped',detail=? WHERE id=? AND token=? AND state='checking'", [reason, job.id, job.token]);
+    await run('UPDATE whatsapp_sender_guard SET lease_until=0 WHERE id=1 AND token=?', [job.token]);
+    return { send: false, reason };
+  }
+  // Serialize every permit globally, with a 36-minute gap and a rolling 24-hour cap.
+  // Reservations consume capacity even if the following request is interrupted.
+  const permit = await run(`UPDATE whatsapp_sender_guard SET last_attempt=?,lease_until=?
+    WHERE id=1 AND token=? AND lease_until>? AND last_attempt<=?
+    AND (SELECT COUNT(*) FROM whatsapp_dispatch WHERE attempt_at>?)<20
+    AND NOT EXISTS(SELECT 1 FROM whatsapp_dispatch WHERE campaign_id=? AND slot_key=? AND attempt_at>0)`,
+    [now, now + 120000, job.token, now, now - 2160000, now - 86400000, job.campaign_id, slot.key]);
+  if (!permit.changes) throw campaignError('Send capacity unavailable.', 409);
+  const result = await run(`UPDATE whatsapp_dispatch SET state='sending',attempt_at=?,slot_key=?
+    WHERE id=? AND token=? AND state='checking'
+    AND EXISTS(SELECT 1 FROM whatsapp_campaigns WHERE id=? AND state='running')
+    AND NOT EXISTS(SELECT 1 FROM whatsapp_suppressions WHERE number=?)
+    AND NOT EXISTS(SELECT 1 FROM whatsapp_inbox WHERE number=?)
+    AND EXISTS(SELECT 1 FROM contractors WHERE id=? AND whatsapp_number=? AND mobile=? AND landline=? AND stage<>'Do Not Contact')`,
+    [now, slot.key, job.id, job.token, job.campaign_id, job.number, job.number,
+      job.contractor_id, snapshot.whatsapp_number, snapshot.mobile, snapshot.landline]);
+  if (!result.changes) throw campaignError('Send cancelled by campaign or recipient change.', 409);
+  return { send: true, id: job.id, token: job.token, number: job.number, message: job.message, expires_at: now + 10000 };
+}
+export async function finishDispatch(input, now = Date.now()) {
+  const job = await one('SELECT * FROM whatsapp_dispatch WHERE id=? AND token=?', [input.id, input.token]);
+  if (!job) throw campaignError('Unknown dispatch receipt.', 409);
+  if (!['sent','uncertain'].includes(input.status)) throw campaignError('Invalid dispatch outcome.');
+  if (input.status === 'sent' && (typeof input.message_id !== 'string' || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.message_id)))
+    throw campaignError('Gateway message ID required.');
+  if (input.status === 'uncertain' && !job.attempt_at && ['checking','skipped'].includes(job.state)) {
+    await run("UPDATE whatsapp_dispatch SET state='skipped',detail='No send permit consumed' WHERE id=? AND token=? AND attempt_at=0", [job.id, job.token]);
+    await run('UPDATE whatsapp_sender_guard SET lease_until=0 WHERE id=1 AND token=?', [job.token]);
+    return { ok: true, not_sent: true };
+  }
+  if (['sent','uncertain'].includes(job.state)) {
+    if (job.state !== input.status || (job.state === 'sent' && job.message_id !== input.message_id))
+      throw campaignError('Conflicting dispatch outcome.', 409);
+  } else {
+    if (job.state !== 'sending') throw campaignError('Dispatch was never authorized.', 409);
+    await run(`UPDATE whatsapp_dispatch SET state=?,message_id=?,confirmed_at=?,detail=? WHERE id=? AND token=? AND state='sending'`,
+      [input.status, input.status === 'sent' ? input.message_id : '', new Date(now).toISOString(),
+        input.status === 'sent' ? 'Gateway accepted; delivery/read not confirmed' : 'Outcome unknown. Do not resend automatically.', job.id, job.token]);
+  }
+  const stored = await one('SELECT state,message_id FROM whatsapp_dispatch WHERE id=?', [job.id]);
+  if (stored.state !== input.status || (stored.state === 'sent' && stored.message_id !== input.message_id))
+    throw campaignError('Conflicting dispatch outcome.', 409);
+  if (input.status === 'sent') {
+    // Idempotent reconciliation; never undo a reply/STOP arriving during the send.
+    await run(`UPDATE contractors SET last_contacted=CASE WHEN last_contacted>? THEN last_contacted ELSE ? END,
+      stage=CASE WHEN stage='Do Not Contact' OR EXISTS(SELECT 1 FROM whatsapp_suppressions WHERE number=?) THEN 'Do Not Contact'
+      WHEN EXISTS(SELECT 1 FROM whatsapp_inbox WHERE number=?) THEN stage
+      WHEN stage IN ('New','Researched','Ready to Contact') THEN 'Contacted' ELSE stage END,
+      updated_at=datetime('now') WHERE id=?`,
+      [job.confirmed_at ? job.confirmed_at.slice(0,10) : new Date(now).toISOString().slice(0,10),
+        job.confirmed_at ? job.confirmed_at.slice(0,10) : new Date(now).toISOString().slice(0,10), job.number, job.number, job.contractor_id]);
+  } else await pauseCampaign(job.campaign_id);
+  await run(`UPDATE whatsapp_campaigns SET state='complete' WHERE id=? AND state='running'
+    AND NOT EXISTS(SELECT 1 FROM whatsapp_dispatch WHERE campaign_id=? AND state IN ('queued','checking','sending'))`, [job.campaign_id, job.campaign_id]);
+  await run('UPDATE whatsapp_sender_guard SET lease_until=0 WHERE id=1 AND token=?', [job.token]);
+  return { ok: true };
 }

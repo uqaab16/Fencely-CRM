@@ -1,0 +1,25 @@
+[Unit]
+Description=Fencely private reviewed WhatsApp campaign sender
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/fencely-wa/worker.env
+ExecStart=/usr/bin/python3 /opt/fencely-wa/campaign-worker.py
+StateDirectory=fencely-sender
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=30
+MemoryMax=128M
+CPUQuota=10%
+TasksMax=16
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
