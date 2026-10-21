@@ -70,6 +70,17 @@ async function createLocalBackend() {
 }
 
 const SCHEMA = [
+`CREATE TABLE IF NOT EXISTS whatsapp_preparations (
+ id TEXT PRIMARY KEY, city TEXT NOT NULL, region TEXT NOT NULL, target INTEGER NOT NULL,
+ candidates TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'checking', token TEXT DEFAULT '',
+ lease_until INTEGER DEFAULT 0, created_at TEXT NOT NULL
+)`,
+`CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_preparation_active_area ON whatsapp_preparations(city,region) WHERE status='checking'`,
+`CREATE TABLE IF NOT EXISTS whatsapp_preparation_items (
+ id TEXT PRIMARY KEY, preparation_id TEXT NOT NULL, contractor_id INTEGER NOT NULL,
+ number TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, token TEXT DEFAULT '',
+ checked_at TEXT DEFAULT '', detail TEXT DEFAULT '', UNIQUE(preparation_id,contractor_id)
+)`,
 `CREATE TABLE IF NOT EXISTS whatsapp_sender_health (
  id INTEGER PRIMARY KEY CHECK(id=1), reported_at INTEGER NOT NULL,
  gateway TEXT NOT NULL, pending INTEGER NOT NULL, error TEXT NOT NULL
@@ -937,4 +948,116 @@ export async function getSenderHealth(now = Date.now()) {
   return { reported_at: row?.reported_at || null, gateway: fresh ? row.gateway : 'unknown', fresh,
     ready: fresh && row.gateway === 'connected' && row.error === 'none' && !row.pending,
     alerts, awaiting_receipt: !!pending?.oldest };
+}
+
+
+// Read-only WhatsApp list building. This queue never authorizes outbound messages.
+async function preparationExcludedNumbers() {
+  const rows = await many(`SELECT number FROM whatsapp_suppressions UNION SELECT number FROM whatsapp_inbox
+    UNION SELECT number FROM whatsapp_dispatch WHERE state IN ('sending','sent','uncertain')`);
+  return new Set(rows.map(r => r.number));
+}
+export async function createWhatsAppPreparation(input = {}) {
+  const city = typeof input.city === 'string' ? input.city.trim().toLowerCase() : '';
+  const region = typeof input.state === 'string' ? input.state.trim().toUpperCase() : '';
+  const target = input.target ?? 20;
+  if (!city || city.length > 100 || (region && !/^[A-Z]{2,3}$/.test(region)) ||
+      !Number.isInteger(target) || target < 1 || target > 20) throw campaignError('Choose a city and a target between 1 and 20.');
+  const existing = await one("SELECT id FROM whatsapp_preparations WHERE city=? AND region=? AND status='checking'", [city, region]);
+  if (existing) return getWhatsAppPreparation(existing.id);
+  // Deliberately no phone-type, WhatsApp-status, has-mobile or registration filters.
+  const candidates = await many(`SELECT id FROM contractors WHERE instr(lower(city),?)>0
+    AND (?='' OR upper(state)=? OR state='') ORDER BY id`, [city, region, region]);
+  const id = randomUUID();
+  await run(`INSERT INTO whatsapp_preparations(id,city,region,target,candidates,created_at)
+    VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING`, [id, city, region, target, JSON.stringify(candidates.map(c => c.id)), new Date().toISOString()]);
+  const actual = await one("SELECT id FROM whatsapp_preparations WHERE city=? AND region=? AND status='checking'", [city, region]);
+  return getWhatsAppPreparation(actual?.id || id);
+}
+export async function listWhatsAppPreparations() {
+  return many('SELECT id,city,region,target,status,created_at FROM whatsapp_preparations ORDER BY created_at DESC');
+}
+export async function getWhatsAppPreparation(id) {
+  const prep = await one('SELECT * FROM whatsapp_preparations WHERE id=?', [String(id)]);
+  if (!prep) throw campaignError('Preparation not found.', 404);
+  const excluded = await preparationExcludedNumbers();
+  const items = await many(`SELECT i.*,c.business_name,c.city,c.state,c.mobile,c.whatsapp_number,c.landline,c.stage
+    FROM whatsapp_preparation_items i LEFT JOIN contractors c ON c.id=i.contractor_id WHERE preparation_id=? ORDER BY i.rowid`, [prep.id]);
+  for (const item of items) {
+    if (item.status === 'available' && (!item.business_name || contractorWhatsAppNumber(item) !== item.number || item.stage === 'Do Not Contact' || excluded.has(item.number))) {
+      await run("UPDATE whatsapp_preparation_items SET status='stale',detail='Number changed, lead removed, replied, opted out or previously attempted' WHERE id=? AND status='available'", [item.id]);
+      item.status = 'stale';
+    }
+  }
+  const available = items.filter(i => i.status === 'available');
+  const candidates = JSON.parse(prep.candidates);
+  // A completed list invalidated later is reported as short; request a fresh list if necessary.
+  const status = available.length >= prep.target ? 'ready' : items.length >= candidates.length && !items.some(i => ['checking','completing'].includes(i.status)) ? 'exhausted' : prep.status === 'ready' ? 'needs_refresh' : 'checking';
+  if (status !== prep.status && status !== 'needs_refresh') await run('UPDATE whatsapp_preparations SET status=? WHERE id=?', [status, prep.id]);
+  return { id: prep.id, city: prep.city, state: prep.region, target: prep.target, status,
+    total_candidates: candidates.length, processed: items.filter(i => !['checking','completing'].includes(i.status)).length,
+    available_count: available.length, available: available.map(i => ({ contractor_id: i.contractor_id,
+      business_name: i.business_name, number: i.number, checked_at: i.checked_at })),
+    results: items.map(i => ({ contractor_id: i.contractor_id, business_name: i.business_name || 'Deleted lead',
+      number: i.number, status: i.status, detail: i.detail })), created_at: prep.created_at };
+}
+export async function claimWhatsAppPreparation(now = Date.now()) {
+  const token = randomUUID();
+  const rows = await many(`UPDATE whatsapp_preparations SET token=?,lease_until=?
+    WHERE id=(SELECT id FROM whatsapp_preparations WHERE status='checking' AND lease_until<=? ORDER BY created_at,id LIMIT 1)
+    RETURNING *`, [token, now + 120000, now]);
+  const prep = rows[0];
+  if (!prep) return null;
+  const summary = await getWhatsAppPreparation(prep.id);
+  if (summary.status !== 'checking') {
+    await run('UPDATE whatsapp_preparations SET lease_until=0 WHERE id=? AND token=?', [prep.id, token]);
+    return null;
+  }
+  const candidates = JSON.parse(prep.candidates);
+  const excluded = await preparationExcludedNumbers();
+  const priorItems = await many('SELECT * FROM whatsapp_preparation_items WHERE preparation_id=?', [prep.id]);
+  const byId = new Map(priorItems.map(item => [item.id, item]));
+  let work = 0;
+  for (const id of candidates) {
+    const itemId = `prep:${prep.id}:${id}`;
+    const previous = byId.get(itemId);
+    if (previous && !['checking','completing'].includes(previous.status)) continue;
+    // Bound a poll so many invalid/excluded records cannot exhaust a Vercel invocation.
+    if (++work > 10) break;
+    const lead = await getContractor(id);
+    const number = lead ? contractorWhatsAppNumber(lead) : null;
+    let status = 'checking', detail = '';
+    if (!lead) { status = 'skipped'; detail = 'Lead deleted'; }
+    else if (!number) { status = 'invalid'; detail = 'Missing or invalid primary phone number'; }
+    else if (lead.stage === 'Do Not Contact' || excluded.has(number)) { status = 'skipped'; detail = 'Opted out, replied or previously attempted'; }
+    else if (priorItems.some(i => i.number === number && i.id !== itemId)) { status = 'duplicate'; detail = 'Duplicate recipient number'; }
+    await run(`INSERT INTO whatsapp_preparation_items(id,preparation_id,contractor_id,number,status,token,detail)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET number=excluded.number,status=excluded.status,token=excluded.token,detail=excluded.detail`,
+      [itemId, prep.id, id, number || '', status, token, detail]);
+    if (status === 'invalid') await saveWhatsAppCheck(id, { number: '', status: 'invalid', checked_at: new Date(now).toISOString(), detail, jid: '' });
+    if (status === 'checking') return { id: itemId, contractor_id: id, number, token };
+  }
+  await getWhatsAppPreparation(prep.id);
+  await run('UPDATE whatsapp_preparations SET lease_until=0 WHERE id=? AND token=?', [prep.id, token]);
+  return null;
+}
+export async function finishWhatsAppPreparation(id, token, result) {
+  const item = await one('SELECT * FROM whatsapp_preparation_items WHERE id=? AND token=?', [id, token]);
+  if (!item || item.number !== result.number) throw campaignError('Preparation lease changed.', 409);
+  if (!['checking','completing'].includes(item.status)) return { ok: true };
+  const lock = await run(`UPDATE whatsapp_preparation_items SET status='completing' WHERE id=? AND token=? AND status='checking'
+    AND EXISTS(SELECT 1 FROM whatsapp_preparations WHERE id=? AND token=? AND lease_until>=?)`,
+    [id, token, item.preparation_id, token, Date.now()]);
+  if (!lock.changes) throw campaignError('Preparation lease expired.', 409);
+  const current = await getContractor(item.contractor_id);
+  let status = result.status, detail = result.detail;
+  if (!current || contractorWhatsAppNumber(current) !== item.number) { status = 'stale'; detail = 'Lead or number changed during check'; }
+  else {
+    await saveWhatsAppCheck(item.contractor_id, result);
+    if (current.stage === 'Do Not Contact' || (await preparationExcludedNumbers()).has(item.number)) { status = 'skipped'; detail = 'Recipient no longer eligible'; }
+  }
+  await run("UPDATE whatsapp_preparation_items SET status=?,checked_at=?,detail=? WHERE id=? AND token=? AND status='completing'", [status, result.checked_at, detail, id, token]);
+  await getWhatsAppPreparation(item.preparation_id);
+  await run('UPDATE whatsapp_preparations SET lease_until=0 WHERE id=? AND token=?', [item.preparation_id, token]);
+  return { ok: true };
 }
