@@ -23,6 +23,7 @@ import { gatewayConfigured, VERIFICATION_LABELS } from './whatsapp.js';
 
 import { requestWhatsAppCheck, bridgeConfigured } from './wa-service.js';
 import { bridgeAuthorized, bridgeResult } from './wa-bridge.js';
+import { readWebhookBody, verifyWebhook, parseWebhook } from './wa-webhook.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Serve the built React app (web/dist) when it exists; fall back to the
@@ -243,6 +244,15 @@ export default async function handler(req, res) {
       if (!auth.checkCronAuth(req)) return send(res, 401, { error: 'Unauthorized' });
       if (req.method !== 'POST' && req.method !== 'GET') return send(res, 405, { error: 'Method not allowed' });
       return send(res, 200, await runUpdateJob());
+    }
+
+    if (p === '/api/whatsapp/webhook') {
+      if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' });
+      const raw = await readWebhookBody(req);
+      verifyWebhook(raw, req.headers['x-webhook-signature']);
+      const event = parseWebhook(raw);
+      if (!event || event.test) return send(res, 200, { ok: true, ignored: !event, test: !!event?.test });
+      return send(res, 200, await db.recordWhatsAppReply(event));
     }
 
     // Dedicated, limited worker credential; never accepts a login/MCP token.

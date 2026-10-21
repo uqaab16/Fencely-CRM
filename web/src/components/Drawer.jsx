@@ -379,6 +379,16 @@ export default function Drawer({ id, meta, refreshTick, onClose, onEdit, onDelet
         <p className="muted small">Checks registration without sending a message. Registration does not establish marketing permission.</p>
       </div>
 
+      {c.whatsapp_outreach?.followup_paused && (
+        <div className="drawer-section" aria-live="polite">
+          <h3>WhatsApp response</h3>
+          <p>{c.whatsapp_outreach.suppressed
+            ? 'Opted out — WhatsApp outreach blocked for this number.'
+            : 'Reply received — automatic WhatsApp follow-ups paused.'}</p>
+          <p className="muted small">Incoming replies are saved in the timeline. Review and respond manually.</p>
+        </div>
+      )}
+
       {/* Actions */}
       <div className="drawer-actions">
         <button className="btn" onClick={() => onEdit(c)}>Edit</button>
